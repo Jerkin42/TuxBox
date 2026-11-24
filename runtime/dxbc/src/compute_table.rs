@@ -141,6 +141,21 @@ fn read_bindings(
             && compute_threads(psv) == Some([32, 1, 1]))
         .and_then(|_| resolve_constants_register(program));
     let mut resolve_constants = None;
+    // A four-dword buffer descriptor represents typed, raw or structured
+    // views. PSV distinguishes those encodings, and FSSM gives the stride.
+    let buffer = |class: u32, register: u32, shape: u32| {
+        let uav = class == 0x303;
+        let typed = if uav { 6 } else { 3 };
+        let (raw, structured) = (typed + 1, typed + 2);
+        let mut types = rows.chunks_exact(stride).filter_map(|row| {
+            if word(row, 8)? != register || word(row, 12)? != register { return None; }
+            let ty = word(row, 0)?;
+            ((ty == raw && shape == 1) || ((ty == typed || ty == structured)
+                && (4..=2048).contains(&shape) && shape.is_multiple_of(4))).then_some(ty)
+        });
+        let ty = types.next()?;
+        types.next().is_none().then_some((u32::from(uav), ty))
+    };
     for [class, offset, register, shape, location] in records {
         let table = if stage == 5 { location >> 16 } else { 0 };
         // Root-less raster programs (RAGE) can receive their descriptor table in
@@ -149,29 +164,12 @@ fn read_bindings(
             && (location >> 8) & 0xff == 9 { 0x800 | (location & 0xff) } else { location };
         let (kind, psv_type) = match (class, descriptor_location) {
             (0x300, 0x408 | 0x10508) if stage == 5 => (0, 3), // typed SRV
-            // A four-dword buffer descriptor represents typed, raw or structured
-            // views. PSV distinguishes those encodings, and FSSM gives the stride.
-            (0x300 | 0x303, 0x404 | 0x10504) if stage == 5 => {
-                let uav = class == 0x303;
-                let typed = if uav { 6 } else { 3 };
-                let raw = typed + 1;
-                let structured = typed + 2;
-                let mut types = rows.chunks_exact(stride).filter_map(|row| {
-                    if word(row, 8)? != register || word(row, 12)? != register { return None; }
-                    let ty = word(row, 0)?;
-                    ((ty == raw && shape == 1) || ((ty == typed || ty == structured)
-                        && (4..=2048).contains(&shape) && shape.is_multiple_of(4))).then_some(ty)
-                });
-                let ty = types.next()?;
-                if types.next().is_some() { return None; }
-                (u32::from(uav), ty)
-            }
+            (0x300 | 0x303, 0x404 | 0x10504) if stage == 5 => buffer(class, register, shape)?,
+            (0x300 | 0x303, 0x804) if stage <= 1 => buffer(class, register, shape)?,
             (0x303, 0x408 | 0x10508) if stage == 5 => (1, 6), // typed UAV
             (0x302, 0x404 | 0x10504) if stage == 5 => (2, 2), // CBV
             (0x300, 0x808) if stage <= 1 => (0, 3),
             (0x303, 0x808) if stage <= 1 => (1, 6),
-            (0x300, 0x804) if stage <= 1 && shape == 1 => (0, 4), // raw SRV
-            (0x300, 0x804) if stage <= 1 && (4..=2048).contains(&shape) && shape % 4 == 0 => (0, 5), // structured SRV
             (0x302, 0x804) if stage <= 1 => (2, 2),
             (2, 0x10904) if stage == 0 => (4, 2), // root constants in s9
             (2, 0x10504 | 0x20604) if stage == 5 => (4, 2),
@@ -222,6 +220,85 @@ fn read_bindings(
     }
     bindings.sort_by_key(|b| (b.table, b.slot));
     Some((bindings, resolve_constants))
+}
+
+/// How a program without an embedded root reads one root argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Argument {
+    /// A view in a descriptor table: kind 0 SRV, 1 UAV, 2 CBV.
+    View { kind: u32, slot: u32 },
+    Constants,
+    /// A root descriptor, with the same kinds.
+    Buffer { kind: u32 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RootUse {
+    pub parameter: u32,
+    pub sgpr: u32,
+    pub argument: Argument,
+    pub register: u32,
+    pub space: u32,
+}
+
+/// Every root argument a program reads, and its sampler registers. A used
+/// resource's location holds `parameter << 16 | sgpr << 8 | dwords`. PSV gives
+/// the register space and has to agree on the resource type.
+pub fn root_uses(bytes: &[u8], stage: u32) -> Option<(Vec<RootUse>, Vec<(u32, u32)>)> {
+    let dxbc = Dxbc::parse(bytes).ok()?;
+    if dxbc.chunk(b"RTS0").is_some() && !matches!(stage, 13 | 14) { return None; }
+    let part = |tag| {
+        let c = dxbc.chunk(tag)?;
+        bytes.get(c.offset..c.offset + c.size)
+    };
+    let dxil = part(b"DXIL")?;
+    if !matches!(stage, 0 | 1 | 5 | 13 | 14) || word(dxil, 0)? >> 16 != stage || dxil.get(8..12)? != b"DXIL" { return None; }
+    let psv = part(b"PSV0")?;
+    let table = psv.get(4 + word(psv, 0)? as usize..)?;
+    let count = word(table, 0)? as usize;
+    let programs = xdat::programs(dxil.get(24..)?).ok()?;
+    let [program] = programs.as_slice() else { return None; };
+    let records = records(program)?;
+    if records.len() != count { return None; }
+    if count == 0 { return Some((Vec::new(), Vec::new())); }
+    let stride = word(table, 4)? as usize;
+    if stride < 16 || count > 1024 { return None; }
+    let rows = table.get(8..)?.get(..count.checked_mul(stride)?)?;
+    let space = |register: u32, types: &[u32]| {
+        let mut spaces = rows.chunks_exact(stride).filter(|r| word(r, 8) == Some(register)
+            && word(r, 12) == Some(register) && word(r, 0).is_some_and(|t| types.contains(&t)));
+        let space = word(spaces.next()?, 4)?;
+        spaces.next().is_none().then_some(space)
+    };
+    let mut uses: Vec<RootUse> = Vec::new();
+    let mut samplers = Vec::new();
+    for [class, offset, register, shape, location] in records {
+        let buffer: &[u32] = match class & 3 { 0 if shape == 1 => &[4], 0 => &[3, 5], 3 if shape == 1 => &[7], _ => &[6, 8, 9] };
+        let (argument, types): (_, &[u32]) = match (class, location & 0xff) {
+            (0x300, 8) => (Argument::View { kind: 0, slot: offset / 8 }, &[3]),
+            (0x303, 8) => (Argument::View { kind: 1, slot: offset / 8 }, &[6]),
+            (0x300, 4) => (Argument::View { kind: 0, slot: offset / 8 }, buffer),
+            (0x303, 4) => (Argument::View { kind: 1, slot: offset / 8 }, buffer),
+            (0x302, 4) => (Argument::View { kind: 2, slot: offset / 8 }, &[2]),
+            (2, 4) => (Argument::Constants, &[2]),
+            (0x100, 4) => (Argument::Buffer { kind: 0 }, &[3, 4, 5]),
+            (0x103, 4) => (Argument::Buffer { kind: 1 }, &[6, 7, 8, 9]),
+            (0x102, 4) => (Argument::Buffer { kind: 2 }, &[2]),
+            (0x401, _) => {
+                samplers.push((register, space(register, &[1])?));
+                continue;
+            }
+            _ => return None,
+        };
+        if matches!(argument, Argument::View { .. }) && offset % 8 != 0 { return None; }
+        let found = RootUse {
+            parameter: location >> 16, sgpr: location >> 8 & 0xff, argument, register,
+            space: space(register, types)?,
+        };
+        if uses.contains(&found) { return None; }
+        uses.push(found);
+    }
+    Some((uses, samplers))
 }
 
 /// One physical descriptor whose FSSM user-data record, used-resource row, and
@@ -277,12 +354,19 @@ pub fn uncovered_descriptor(
         root.params.get(table as usize).map(|param| &param.kind),
         Some(crate::rootsig::RootParamKind::Table(_))
     ) || table_covers_slot(root, table, slot)
-        || root_declares(root, kind, register, space)
     {
         return None;
     }
+    // An embedded root numbers its ranges independently of the shader. A number it gave to
+    // another slot is replaced with one of our own.
+    if root_declares(root, kind, register, space) {
+        return Some((kind, slot, UNCOVERED_SPACE + table));
+    }
     Some((kind, register, space))
 }
+
+/// Spaces of slots whose own register an embedded root already uses, one per table.
+const UNCOVERED_SPACE: u32 = 32_700;
 
 /// FSSM descriptor slots missing from an embedded root. Each returned binding
 /// is one range to append: the slot is uncovered and the register is free.
@@ -783,7 +867,7 @@ mod tests {
         let taken = root(vec![RootRange {
             range_type: 2, num: 1, base_register: 28, space: 1, offset_in_table: 16,
         }]);
-        assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 0x320, &taken), None);
+        assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 0x320, &taken), Some((2, 25, 32_701)));
     }
 
     #[test]
