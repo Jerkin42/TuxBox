@@ -568,6 +568,8 @@ struct Emitter<'a> {
     /// Each pixel is a wave of its own.
     pixel_wave: bool,
     dispatched: bool,
+    /// The block dispatcher steps the four lanes of a quad together.
+    quad_lockstep: bool,
     /// The reduction being emitted adds.
     pixel_sum: bool,
     flat_attrs: BTreeSet<usize>,
@@ -2085,6 +2087,7 @@ impl<'a> Emitter<'a> {
             pulled_attrs: BTreeSet::new(),
             pixel_wave: false,
             dispatched: false,
+            quad_lockstep: false,
             pixel_sum: false,
             flat_attrs: BTreeSet::new(),
             ps_in_interp: InputInterp::default(),
@@ -4247,6 +4250,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     return self.emit_body_dispatch(is_ps, 0);
                 }
             }
+            if self.lockstep_exchanges(0)
+                && self.insns[l1..=b1].iter().any(is_quad_exchange)
+            {
+                return self.emit_body_dispatch(is_ps, 0);
+            }
             // A forward branch from before the header into the body (the usual rotated
             // `while`: jump straight to the condition) is handled by the skip flags: the
             // flag stays set on the first iteration, so everything before the label is
@@ -4392,11 +4400,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 }
                 let source = r(&ins.src[0])?;
                 if self.pixel_wave && ins.op != OP_ROW_MIRROR {
-                    // Quad operations include helper lanes, as FI=1 does. Lane bits are x, y.
-                    let perm = ins.aux.imm;
-                    self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
-                    self.line(&format!("uint q{i}x = QuadReadAcrossX({source}), q{i}y = QuadReadAcrossY({source}), q{i}d = QuadReadAcrossDiagonal({source});"));
-                    self.line(&format!("uint q{i} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
+                    self.pixel_quad_read(i, ins, &source, "uint ");
                 } else if ins.op == OP_ROW_MIRROR {
                     // FI=0: a source lane inactive in EXEC contributes 0. row_mirror
                     // mirrors local lanes within a 16-lane row.
@@ -4487,10 +4491,33 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         Ok(())
     }
 
+    /// Read a quad neighbour into `q{i}`. Quad operations include helper lanes, as FI=1
+    /// does. Lane bits are x, y.
+    fn pixel_quad_read(&mut self, i: usize, ins: &Insn, source: &str, declare: &str) {
+        let perm = ins.aux.imm;
+        self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
+        self.line(&format!("uint q{i}x = QuadReadAcrossX({source}), q{i}y = QuadReadAcrossY({source}), q{i}d = QuadReadAcrossDiagonal({source});"));
+        self.line(&format!("{declare}q{i} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
+    }
+
+    /// Whether the program's exchanges from `entry` on are all quad reads of a pixel
+    /// program, which the block dispatcher can serve by stepping each quad together.
+    fn lockstep_exchanges(&self, entry: usize) -> bool {
+        let mut exchanges = self.insns.iter().skip(entry).filter(|i| is_quad_exchange(i)).peekable();
+        self.ex.stage == Stage::Pixel && self.pixel_wave && exchanges.peek().is_some()
+            && exchanges.all(|i| i.op == OP_QUAD_MOVE || i.op == OP_QUAD_ADD_F32)
+    }
+
     /// Follow guest basic blocks from `entry`. Each block sets the next block id
     /// (`tb_pc`). The id one past the last instruction terminates the program.
     /// (Implicit-derivative sampling cannot live inside this loop — FXC rejects it, and the
     /// shader then fails to compile rather than silently changing meaning.)
+    ///
+    /// A pixel program that reads its quad neighbours runs each quad lowest block first.
+    /// Block ids are in program order, so a lane that skipped a region waits, its registers
+    /// unchanged, until the lanes inside have passed it: what EXEC does to it on the console.
+    /// All four lanes stay in the loop until the whole quad is done, and each exchange
+    /// starts a block, so its source registers are read by the four lanes together.
     fn emit_body_dispatch(&mut self, is_ps: bool, entry: usize) -> Result<(), String> {
         self.dispatched = true;
         let n = self.insns.len();
@@ -4521,9 +4548,21 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 leaders.insert(i + 1);
             }
         }
+        self.quad_lockstep = self.lockstep_exchanges(entry);
+        let exchanges: Vec<usize> = if self.quad_lockstep {
+            (entry..n).filter(|&i| is_quad_exchange(&self.insns[i])).collect()
+        } else {
+            Vec::new()
+        };
+        leaders.extend(&exchanges);
         let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
         self.loop_depth = 0;
-        if entry == 0 {
+        if self.quad_lockstep {
+            self.line(&format!("uint tb_pc = {entry}u; uint tb_guard = 0u;"));
+            self.line("[loop] while (tb_guard++ < 1000000u) {");
+            self.line("uint tb_low = min(min(tb_pc, QuadReadAcrossX(tb_pc)), min(QuadReadAcrossY(tb_pc), QuadReadAcrossDiagonal(tb_pc)));");
+            self.line(&format!("if (tb_low == {n}u) break;"));
+        } else if entry == 0 {
             self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
             self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 1000000u) {{"));
         } else {
@@ -4532,8 +4571,20 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         self.loop_depth += 1;
         // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
         // `switch` whose selector is assigned inside its cases).
-        self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
         let insns = self.insns.clone();
+        if self.quad_lockstep {
+            for &i in &exchanges {
+                let ins = &insns[i];
+                self.touch(&ins.src[0]);
+                let source = r(&ins.src[0])?;
+                self.line(&format!("uint q{i} = 0u; if (tb_low == {i}u) {{"));
+                self.pixel_quad_read(i, ins, &source, "");
+                self.line("}");
+            }
+            self.line("uint tb_sel = tb_pc == tb_low ? tb_pc : 0xfffffffeu; if (tb_pc == tb_low) tb_pc = 0xffffffffu;");
+        } else {
+            self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
+        }
         for (b, &start) in starts.iter().enumerate() {
             let end = starts.get(b + 1).copied().unwrap_or(n);
             self.line(&format!("if (tb_sel == {start}u) {{"));
@@ -6111,7 +6162,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             return self.ws(&d, &read);
         }
         if is_quad_exchange(ins) {
-            if self.dispatched { return Err("quad exchange in a block-dispatched program".into()); }
+            if self.dispatched && !self.quad_lockstep { return Err("quad exchange in a block-dispatched program".into()); }
             if ins.op != OP_QUAD_ADD_F32 { return self.wv(&d, &format!("q{}", self.cur_idx)); }
             return self.wv(&d, &format!("asuint(asfloat(q{}) + {})", self.cur_idx, f(&s[1])?));
         }

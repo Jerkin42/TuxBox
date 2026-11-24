@@ -441,6 +441,30 @@ mod tests {
     }
 
     #[test]
+    fn quad_reads_in_a_pixel_loop_step_the_quad_together() {
+        // v1 = quad lane 0's v0 (DPP16 quad_perm 0, FI=1); loop while v1 > v0.
+        let quad_move = [0x7e0202fa, 0xff0c0000];
+        let code = [
+            &SAMPLE[..8],
+            &quad_move[..],
+            &[0x7d880101, 0xbf87fffc, 0xbf810000][..], // v_cmp_gt_u32 vcc, v1, v0; s_cbranch_vccnz
+        ]
+        .concat();
+        let out = super::super::translate(&pixel(&code)).unwrap();
+        for line in [
+            "uint tb_low = min(min(tb_pc, QuadReadAcrossX(tb_pc)), min(QuadReadAcrossY(tb_pc), QuadReadAcrossDiagonal(tb_pc)));",
+            "if (tb_pc == tb_low) tb_pc = 0xffffffffu;",
+            "QuadReadAcrossDiagonal(v0)",
+        ] {
+            assert!(out.hlsl.contains(line), "{line}\n{}", out.hlsl);
+        }
+        // Outside a loop the reads need no dispatcher.
+        let straight = [&SAMPLE[..8], &quad_move[..], &[0xbf810000][..]].concat();
+        let out = super::super::translate(&pixel(&straight)).unwrap();
+        assert!(out.hlsl.contains("QuadReadAcrossDiagonal(v0)") && !out.hlsl.contains("tb_pc"));
+    }
+
+    #[test]
     fn pixel_heap_bases_need_one_row_and_the_feature() {
         let base = super::super::pixel_heap_base;
         let ex = pixel(&SAMPLE);
