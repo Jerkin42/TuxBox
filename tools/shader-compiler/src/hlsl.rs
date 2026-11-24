@@ -4478,7 +4478,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         self.loop_depth = 0;
         if entry == 0 {
             self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
-            self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 50000u) {{"));
+            self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 1000000u) {{"));
         } else {
             self.line(&format!("uint tb_pc = {entry}u; [loop] while (tb_pc != {n}u) {{"));
         }
@@ -6707,8 +6707,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             self.tmp += 1;
             self.line("#if __SHADER_TARGET_MAJOR >= 6");
             self.line(&format!("uint t{t} = WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu);"));
-            // With no lane selected, lane 0 may not even be running, and reading it is undefined.
-            self.ws(&d, &format!("t{t} == 0xffffffffu ? 0u : WaveReadLaneAt({value}, t{t} == 0xffffffffu ? 0u : t{t})"))?;
+            self.ws(&d, &format!("WaveReadLaneAt({value}, t{t} == 0xffffffffu ? 0u : t{t})"))?;
             self.line("#else");
             self.ws(&d, &value)?;
             self.line("#endif");
