@@ -1,4 +1,5 @@
 """Compile Xbox shaders and link raster stages requested by a running Proton game."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -10,7 +11,7 @@ import stat
 import struct
 import subprocess
 from tempfile import TemporaryDirectory
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from .inspect import digest
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, has_dxil_container, run_tool
@@ -18,6 +19,7 @@ from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, has_dxil_con
 
 MAX_SHADER_BYTES = 64 << 20
 XSHADER_UNSUPPORTED_HLSL = 65
+LARGE_HLSL_BYTES = 256 << 10
 SOURCE_KEY = r"[a-f0-9]{64}"
 STENCIL_KEY = SOURCE_KEY + r"_rt[0-7]"
 LINK_KEY = "_".join([SOURCE_KEY] * 3)
@@ -152,7 +154,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         # under a second or sit in it until the cap. The ones that sit there
         # compile at -O0 in a few seconds, and the driver optimises that DXIL
         # again when it builds the pipeline.
-        if target == "cs_6_6":
+        # Other large programs take up to 15 times as long optimised, while the game waits.
+        if target == "cs_6_6" or hlsl.is_file() and hlsl.stat().st_size > LARGE_HLSL_BYTES:
             run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
         else:
             try:
@@ -251,53 +254,86 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
         except (OSError, ValueError, subprocess.SubprocessError):
             pass  # Retry and report the error if this game needs a shader.
     refused = cached_refusals = 0
+    lock = Lock()
 
     def remember(source, inputs):
         nonlocal archive
-        if archive is not None:
+        with lock:
+            target = archive
+        if target is not None:
             try:
-                archive_request(archive, source, inputs)
+                archive_request(target, source, inputs)
             except OSError as exc:
                 report(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
-                archive = None
+                with lock:
+                    archive = None
 
-    while not stop.is_set():
-        directory = session / "requests"
-        requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
-        if not requests:
-            wait()
-            continue
-        for source in requests:
-            if stop.is_set():
-                break
-            key = source.stem
-            if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
-                remove_request(source)
-                continue
-            failed = False
-            try:
-                if tools is None:
-                    tools, cache = bind_cache()
-                if archive is None:
-                    compiled = compile_request(source, key, tools, cache, session)
-                else:
-                    compiled = compile_request(source, key, tools, cache, session, remember=remember)
-                if compiled:
-                    report(f"Compiled Xbox shader {key}")
-            except ShaderRefused as exc:
-                failed = True
+    def compile_one(source):
+        nonlocal refused, cached_refusals
+        key = source.stem
+        failed = False
+        try:
+            keep = {} if archive is None else {"remember": remember}
+            compiled = compile_request(source, key, tools, cache, session, **keep)
+            if compiled:
+                report(f"Compiled Xbox shader {key}")
+        except ShaderRefused as exc:
+            failed = True
+            with lock:
                 if exc.cached:
                     cached_refusals += 1
                 else:
                     refused += 1
-                    report(f"Xbox shader {key}: {exc}")
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                failed = True
+            if not exc.cached:
                 report(f"Xbox shader {key}: {exc}")
-            finally:
-                remove_request(source)
-                if failed:
-                    (session / (key + ".failed")).touch()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            failed = True
+            # The same inputs fail the same way. Do not hold the game up again for them.
+            if isinstance(exc, (ToolFailure, subprocess.TimeoutExpired)):
+                with lock:
+                    broken.add(source.name)
+            report(f"Xbox shader {key}: {exc}")
+        finally:
+            remove_request(source)
+            if failed:
+                (session / (key + ".failed")).touch()
+            with lock:
+                active.discard(source.name)
+
+    # The guest waits on several requests at once, one per thread that creates pipelines.
+    active, broken = set(), set()
+    with ThreadPoolExecutor(max(1, min(8, (os.cpu_count() or 2) // 2))) as workers:
+        while not stop.is_set():
+            directory = session / "requests"
+            # A finished request leaves the directory before it leaves the active set.
+            with lock:
+                busy = set(active)
+            requests = [path for pattern in ("*.dxbc", "*.link", "*.stencil")
+                        for path in directory.glob(pattern) if path.name not in busy]
+            if not requests:
+                wait()
+                continue
+            for source in requests:
+                if stop.is_set():
+                    break
+                if not re.fullmatch(REQUEST_PATTERNS[source.suffix], source.stem):
+                    remove_request(source)
+                    continue
+                if tools is None:
+                    try:
+                        tools, cache = bind_cache()
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        report(f"Xbox shader {source.stem}: {exc}")
+                        remove_request(source)
+                        (session / (source.stem + ".failed")).touch()
+                        continue
+                if source.name in broken:
+                    remove_request(source)
+                    (session / (source.stem + ".failed")).touch()
+                    continue
+                with lock:
+                    active.add(source.name)
+                workers.submit(compile_one, source)
     if refused or cached_refusals:
         report(f"Xbox shader worker: {refused} new unsupported translations, {cached_refusals} cached refusals")
 
