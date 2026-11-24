@@ -10,7 +10,7 @@ use super::Device;
 use core::{ffi::c_void, ops::Range};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, Weak};
 use tuxbox_xg_layout::{Desc, Plane};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -55,7 +55,9 @@ fn committed(
             &mut native,
         )?;
     }
-    native.ok_or_else(|| E_POINTER.into())
+    let native: ID3D12Resource = native.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+    crate::vram::resource(&native, "placement");
+    Ok(native)
 }
 
 struct Mip {
@@ -71,10 +73,39 @@ struct Mip {
 
 #[derive(Default)]
 struct Contents {
-    // An exact copy makes writes to shared pages and all-zero rewrites observable.
-    previous: Vec<Vec<u8>>,
+    // A fingerprint of each mip's guest bytes makes rewrites observable without
+    // keeping a second copy of every texture the title has loaded.
+    previous: Vec<Option<[u64; 2]>>,
     uploaded: u64,
+    // Compared with guest memory at least once.
+    checked: bool,
+    // LOCAL: written by the GPU and not published to guest memory.
+    private: bool,
     readers: Vec<(ID3D12Fence, u64)>,
+}
+
+/// Two independent folded-multiply lanes over 16-byte blocks.
+fn fingerprint(bytes: &[u8]) -> [u64; 2] {
+    fn fold(a: u64, b: u64) -> u64 {
+        let wide = u128::from(a) * u128::from(b);
+        wide as u64 ^ (wide >> 64) as u64
+    }
+    const K: [u64; 4] = [0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db, 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3];
+    let mut h = [K[0] ^ bytes.len() as u64, K[2]];
+    let word = |part: &[u8]| {
+        let mut raw = [0; 8];
+        raw[..part.len()].copy_from_slice(part);
+        u64::from_le_bytes(raw)
+    };
+    let mut blocks = bytes.chunks_exact(16);
+    for block in &mut blocks {
+        let (a, b) = (word(&block[..8]), word(&block[8..]));
+        h = [fold(a ^ K[1] ^ h[0], b ^ K[0]).wrapping_add(h[0].rotate_left(23)), fold(b ^ K[3] ^ h[1], a ^ K[2]).wrapping_add(h[1].rotate_left(41))];
+    }
+    let mut last = [0; 16];
+    last[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
+    let (a, b) = (word(&last[..8]), word(&last[8..]));
+    [fold(a ^ h[0], b ^ K[1] ^ h[1]), fold(b ^ h[1] ^ K[3], a ^ h[0].rotate_left(17) ^ K[2])]
 }
 
 struct Alias {
@@ -98,6 +129,7 @@ pub(crate) struct Texture {
 
 impl Drop for Texture {
     fn drop(&mut self) {
+        crate::audit::remove(&self.native);
         crate::exports::profiling::mapping_released();
         let Some(images) = self.images.upgrade() else {
             return;
@@ -284,9 +316,10 @@ impl Texture {
             });
         }
         let contents = Mutex::new(Contents {
-            previous: vec![Vec::new(); mips.len()],
+            previous: vec![None; mips.len()],
             ..Default::default()
         });
+        crate::audit::add(&native, address, "placed");
         Ok(Arc::new(Self {
             native,
             desc: *desc,
@@ -328,16 +361,19 @@ impl Texture {
         scratch: &mut Vec<u8>,
     ) -> Result<()> {
         let mut contents = lock(&self.contents);
+        contents.checked = true;
         for (level, mip) in self.mips.iter().enumerate() {
             if !self.snapshot_mip(mip, scratch)? {
-                contents.previous[level].clear();
+                contents.previous[level] = None;
                 continue;
             }
-            if *scratch != contents.previous[level] {
+            let print = fingerprint(scratch);
+            if contents.previous[level] != Some(print) {
                 changes.push(upload::Change {
                     texture: self.clone(),
                     level,
                     bytes: std::mem::take(scratch),
+                    print,
                 });
             }
         }
@@ -442,6 +478,7 @@ impl PlacementMemory {
                     && unsafe { write.published.GetCompletedValue() } < write.tick
             })
         });
+        let _span = crate::timing::span("flush.refresh");
         submissions.transfer.refresh(device, &textures)
     }
 }
@@ -528,6 +565,26 @@ fn unique(textures: &mut Vec<Arc<Texture>>) {
 
 // Descriptor contents may change after command-list Close. Resolve SRVs in the
 // shader-visible heaps that actually participated in a draw or dispatch.
+/// Title waits on fence words that are submitted but not yet satisfied.
+///
+/// The dependencies below follow submission order across queues. A title orders
+/// its queues with its own fence words, and may submit a wait before the batch
+/// that satisfies it. Waiting here for such a queue closes a cycle: the batch
+/// that writes the word would wait for the batch that waits for it. With no
+/// title wait outstanding, all earlier work can finish, so no cycle is possible.
+pub(crate) static TITLE_WAITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(super) fn ordered_by_title(path: &'static str) -> bool {
+    let waits = TITLE_WAITS.load(Ordering::Acquire);
+    if waits == 0 { return false; }
+    static SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::diagnostics::log(&format!("PLACEMENT-SKIP {path} title_waits={waits} ({n} so far)"));
+    }
+    true
+}
+
 pub(crate) unsafe fn submit(
     device: *mut c_void,
     queue: &ID3D12CommandQueue,
@@ -539,7 +596,10 @@ pub(crate) unsafe fn submit(
 ) -> Result<()> {
     let device = unsafe { &*device.cast::<Device>() };
     let placements = &device.state.placements;
-    placements.views.gather(heaps, textures, writes);
+    {
+        let _span = crate::timing::span("sub.gather");
+        placements.views.gather(heaps, textures, writes);
+    }
     unique(writes);
     textures
         .try_reserve(writes.len())
@@ -572,7 +632,9 @@ pub(crate) unsafe fn submit(
         }
     }
 
+    let locking = crate::timing::span("sub.lock");
     let mut slot = lock(&placements.memory.submissions);
+    drop(locking);
     HRESULT(placements.memory.failed.load(Ordering::Acquire)).ok()?;
     let submission = match slot.as_mut() {
         Some(s) => s,
@@ -604,16 +666,21 @@ pub(crate) unsafe fn submit(
             }
             // CPU bytes still contain the old version. The native image contains
             // the ordered GPU write and can be read directly by the next batch.
-            unsafe { queue.Wait(&write.published, write.tick)? };
+            if access.published_by_this_queue(&write.published) || !ordered_by_title("published") {
+                unsafe { queue.Wait(&write.published, write.tick)? };
+            }
             pending = true;
         }
-        if !pending {
+        if !pending && !lock(&texture.contents).private {
             refresh.push(texture.clone());
         }
     }
 
     let transfer = &mut submission.transfer;
-    transfer.refresh(&device.native, &refresh)?;
+    {
+        let _span = crate::timing::span("sub.refresh");
+        transfer.refresh(&device.native, &refresh)?;
+    }
     let required = textures
         .iter()
         .map(|t| lock(&t.contents).uploaded)
@@ -624,13 +691,26 @@ pub(crate) unsafe fn submit(
     }
     for texture in writes.iter() {
         for (fence, value) in &lock(&texture.contents).readers {
-            if fence != reader && unsafe { fence.GetCompletedValue() } < *value {
+            if fence != reader && unsafe { fence.GetCompletedValue() } < *value && !ordered_by_title("reader") {
                 unsafe { queue.Wait(fence, *value)? };
             }
         }
     }
     let tick = transfer.tick()?;
-    let publication = if writes.is_empty() {
+    // LOCAL: skip copying GPU-written images back to guest memory.
+    static SKIP_READBACK: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_NO_READBACK").is_some());
+    if crate::timing::on() {
+        static SEEN: Mutex<BTreeMap<(u64, u64, u32, i32, i32), ()>> = Mutex::new(BTreeMap::new());
+        for t in writes.iter() {
+            let mut seen = lock(&SEEN);
+            if seen.len() < 160 && seen.insert((t.address, t.desc.Width, t.desc.Height, t.desc.Format.0, t.desc.Flags.0), ()).is_none() {
+                drop(seen);
+                crate::diagnostics::log(&format!("READBACK {:#x} {}x{}x{} m{} f{} fl{:x} layout={:#x} bytes={:#x}", t.address, t.desc.Width, t.desc.Height,
+                    t.desc.DepthOrArraySize, t.desc.MipLevels, t.desc.Format.0, t.desc.Flags.0, t.desc.Layout.0, t.size));
+            }
+        }
+    }
+    let publication = if writes.is_empty() || *SKIP_READBACK {
         None
     } else {
         submission
@@ -642,7 +722,10 @@ pub(crate) unsafe fn submit(
             writeback::Readback::record(&device.native, unsafe { queue.GetDesc() }.Type, writes)?;
         Some((worker, readback))
     };
-    execute()?;
+    {
+        let _span = crate::timing::span("sub.execute");
+        execute()?;
+    }
     if let Some((_, readback)) = &publication {
         // Separate ExecuteCommandLists calls allow simultaneous-access textures
         // to decay to COMMON between the guest batch and this copy.
@@ -680,6 +763,9 @@ pub(crate) unsafe fn submit(
                 tick,
             });
         }
+    }
+    if *SKIP_READBACK {
+        for texture in writes.iter() { lock(&texture.contents).private = true; }
     }
     for texture in textures {
         let mut state = lock(&texture.contents);

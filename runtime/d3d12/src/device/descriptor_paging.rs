@@ -19,6 +19,43 @@ pub(crate) struct Registry {
     count: std::sync::atomic::AtomicUsize,
     next_version: AtomicU64,
     identity_map: Mutex<Option<ID3D12Resource>>,
+    snapshots: Mutex<Option<Snapshots>>,
+}
+
+/// A title copies a descriptor's record out of a staging cell and then reuses
+/// the cell. Keep the host descriptor each recent record named, so the copies
+/// still resolve.
+struct Snapshots {
+    heap: ID3D12DescriptorHeap,
+    stride: usize,
+    records: Vec<(usize, u64)>,
+    imported: super::placement::DescriptorRange<super::views::DescriptorBacking>,
+    placed: super::placement::DescriptorRange<super::placement::PlacedView>,
+    scenes: super::placement::DescriptorRange<super::blas::SceneView>,
+}
+impl Snapshots {
+    const COUNT: usize = 1 << 19;
+    fn create(arena: &Arena) -> Option<Self> {
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: Self::COUNT as u32,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0,
+        };
+        let heap: ID3D12DescriptorHeap = unsafe { arena.device.CreateDescriptorHeap(&desc) }.ok()?;
+        Some(Self {
+            imported: arena.imported.sibling(&arena.device, &heap, &desc)?,
+            placed: arena.placed.sibling(&arena.device, &heap, &desc)?,
+            scenes: arena.scenes.sibling(&arena.device, &heap, &desc)?,
+            stride: arena.stride, records: vec![(0, 0); Self::COUNT], heap,
+        })
+    }
+    fn slot(version: u64) -> usize { version as usize % Self::COUNT }
+    fn handle(&self, slot: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: unsafe { self.heap.GetCPUDescriptorHandleForHeapStart() }.ptr + slot * self.stride }
+    }
+    fn get(&self, record: InlineDescriptor) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        let slot = Self::slot(record.version);
+        (self.records[slot] == (record.source, record.version)).then(|| self.handle(slot))
+    }
 }
 impl Registry {
     pub(crate) fn find(&self, address: usize) -> Option<Arc<Arena>> {
@@ -28,6 +65,18 @@ impl Registry {
         let entries = self.arenas.lock().unwrap_or_else(|e| e.into_inner());
         let arena = entries.range(..=address).next_back()?.1.upgrade()?;
         (address - arena.base() < arena.count as usize * arena.stride).then_some(arena)
+    }
+    /// LOCAL: see `Arena::sync_copied`. Throttled; measures whether it matters.
+    pub(crate) fn sync_copied(&self) {
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let full = {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(5));
+            if due { *last = Some(std::time::Instant::now()); }
+            due
+        };
+        let arenas: Vec<_> = self.arenas.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(Weak::upgrade).collect();
+        for arena in arenas { arena.sync_copied(full); }
     }
     pub(super) fn copy_source(&self, handle: D3D12_CPU_DESCRIPTOR_HANDLE) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let Some(arena) = self.find(handle.ptr) else { return handle; };
@@ -51,6 +100,34 @@ struct InlineDescriptor {
     version: u64,
     reserved: [u64; 2],
 }
+const PAGE: usize = 128;
+
+/// The record each native slot holds. The slots that coincide with the title's
+/// are dense; aliases above them are not.
+#[derive(Default)]
+struct Resident { dense: Vec<Option<InlineDescriptor>>, rest: BTreeMap<usize, InlineDescriptor> }
+impl Resident {
+    fn new(dense: u32) -> Self { Self { dense: vec![None; dense as usize], rest: BTreeMap::new() } }
+    fn get(&self, slot: usize) -> Option<InlineDescriptor> {
+        match self.dense.get(slot) {
+            Some(record) => *record,
+            None => self.rest.get(&slot).copied(),
+        }
+    }
+    fn insert(&mut self, slot: usize, record: InlineDescriptor) {
+        match self.dense.get_mut(slot) {
+            Some(entry) => *entry = Some(record),
+            None => { self.rest.insert(slot, record); }
+        }
+    }
+    fn remove(&mut self, slot: usize) {
+        match self.dense.get_mut(slot) {
+            Some(entry) => *entry = None,
+            None => { self.rest.remove(&slot); }
+        }
+    }
+    fn forget_aliases(&mut self) { self.rest.clear(); }
+}
 const INLINE_BYTES: usize = size_of::<InlineDescriptor>();
 
 pub(crate) struct Arena {
@@ -66,17 +143,22 @@ pub(crate) struct Arena {
     count: u32,
     limit: u32,
     inline: bool,
+    // Guest and native slots coincide below this, so shader-supplied heap
+    // indices are valid. Tables that reach above it use aliases.
+    identity: u32,
     authored: Mutex<BTreeMap<usize, u64>>,
     // Guest ranges can overlap. Keep stable slots for every table that has
     // been referenced; a CPU descriptor update is published to each alias.
     tables: Mutex<Tables>,
+    // The records the last scan saw, to find the title's own copies.
+    shadow: Mutex<(Vec<InlineDescriptor>, Vec<u64>, u64)>,
 }
 #[derive(Default)]
 struct Tables {
     used: u32,
     ranges: BTreeMap<(u32, u32), u32>,
     direct: index_map::Direct,
-    resident_records: BTreeMap<usize, InlineDescriptor>,
+    resident_records: Resident,
 }
 impl Drop for Arena {
     fn drop(&mut self) {
@@ -96,7 +178,7 @@ impl Arena {
     pub(super) fn create(
         owner: &super::Device,
         desc: &D3D12_DESCRIPTOR_HEAP_DESC,
-        limit: u32,
+        mut limit: u32,
     ) -> Result<Arc<Self>> {
         let registry = &owner.state.descriptor_arenas;
         let device = &owner.native;
@@ -110,7 +192,14 @@ impl Arena {
         };
         let staging: ID3D12DescriptorHeap = unsafe { device.CreateDescriptorHeap(&cpu)? };
         let visible = if desc.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE {
-            unsafe { device.CreateDescriptorHeap(&gpu)? }
+            let full = D3D12_DESCRIPTOR_HEAP_DESC { ..*desc };
+            match unsafe { device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&full) } {
+                Ok(heap) => { limit = limit.max(desc.NumDescriptors); heap }
+                Err(error) => {
+                    crate::diagnostics::log(&format!("HEAP full size {} refused: {:?}", desc.NumDescriptors, error.code()));
+                    unsafe { device.CreateDescriptorHeap(&gpu)? }
+                }
+            }
         } else {
             staging.clone()
         };
@@ -118,6 +207,15 @@ impl Arena {
         let bytes = stride
             .checked_mul(desc.NumDescriptors as usize)
             .ok_or(E_OUTOFMEMORY)?;
+        let identity = if !owner.state.device11_queue || stride != INLINE_BYTES || std::env::var_os("TUXBOX_NO_IDENTITY_HEAP").is_some() {
+            0
+        } else if desc.NumDescriptors <= limit {
+            desc.NumDescriptors
+        } else {
+            limit - limit / 8
+        };
+        crate::diagnostics::log(&format!("HEAP arena count={} limit={limit} visible={} stride={stride} identity={identity}",
+            desc.NumDescriptors, desc.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE));
         let memory = GuestMemory::allocate(bytes, 0x0480_0004)?;
         let arena = Arc::new(Self {
             imported: owner.state.imported_views.heap(device, &staging, &cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV).ok_or(E_INVALIDARG)?,
@@ -152,8 +250,10 @@ impl Arena {
             count: desc.NumDescriptors,
             limit,
             inline: owner.state.device11_queue && stride >= INLINE_BYTES && stride.is_multiple_of(INLINE_BYTES),
+            identity,
             authored: Mutex::default(),
-            tables: Mutex::new(Tables::default()),
+            tables: Mutex::new(Tables { used: identity, resident_records: Resident::new(if desc.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE { identity } else { 0 }), ..Default::default() }),
+            shadow: Mutex::default(),
         });
         let mut entries = registry.arenas.lock().unwrap_or_else(|e| e.into_inner());
         entries.insert(arena.base(), Arc::downgrade(&arena));
@@ -162,6 +262,65 @@ impl Arena {
             .store(entries.len(), std::sync::atomic::Ordering::Release);
         Ok(arena)
     }
+    pub(crate) fn is_identity(&self) -> bool { self.identity != 0 }
+
+    /// LOCAL: publish records the title copied itself into slots no table names.
+    fn sync_copied(&self, full: bool) {
+        if self.identity == 0 || self.visible == self.staging { return; }
+        let started = std::time::Instant::now();
+        let (mut copied, mut pages) = (0u64, 0u64);
+        // Compare whole pages with what the last scan saw. Recording threads
+        // resolve tables meanwhile, so hold their lock only to write a page.
+        let mut shadow = self.shadow.lock().unwrap_or_else(|e| e.into_inner());
+        let (shadow, warm, calls) = &mut *shadow;
+        if shadow.is_empty() {
+            shadow.resize(self.count as usize, InlineDescriptor::default());
+            warm.resize((self.count as usize).div_ceil(PAGE), 0);
+        }
+        *calls += 1;
+        let start = unsafe { self.visible.GetCPUDescriptorHandleForHeapStart() };
+        for (page, seen) in shadow.chunks_mut(PAGE).enumerate() {
+            // Between full passes, look at the pages that changed lately.
+            if !full && (warm[page] == 0 || *calls - warm[page] > 2000) { continue; }
+            let first = page * PAGE;
+            let cells = (self.base() + first * INLINE_BYTES) as *const InlineDescriptor;
+            // The title writes this committed memory at any time; a torn record
+            // differs from the next scan's and is taken then.
+            let same = unsafe { std::slice::from_raw_parts(cells.cast::<u64>(), seen.len() * 4) }
+                == unsafe { std::slice::from_raw_parts(seen.as_ptr().cast::<u64>(), seen.len() * 4) };
+            if same { continue; }
+            pages += 1;
+            warm[page] = *calls;
+            let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, old) in seen.iter_mut().enumerate() {
+                let slot = first + index;
+                let cell = self.base() + slot * INLINE_BYTES;
+                let record = self.inline_record(cell);
+                if record == *old { continue; }
+                *old = record;
+                // A record names a descriptor cell; skip the title's own data cheaply.
+                if record.source < 0x10000 || record.source == cell || record.source & 15 != 0
+                    || record.version == 0 || record.reserved != [0; 2] || slot >= self.identity as usize
+                    || tables.resident_records.get(slot) == Some(record) { continue; }
+                let Some(from) = self.resolve_inline(record) else { continue; };
+                self.copy_native_view(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + slot * self.stride }, from);
+                tables.resident_records.insert(slot, record);
+                copied += 1;
+            }
+        }
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static NANOS: AtomicU64 = AtomicU64::new(0);
+        static PAGES: AtomicU64 = AtomicU64::new(0);
+        TOTAL.fetch_add(copied, Ordering::Relaxed);
+        PAGES.fetch_add(pages, Ordering::Relaxed);
+        NANOS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if CALLS.fetch_add(1, Ordering::Relaxed) % 1000 == 999 {
+            crate::diagnostics::log(&format!("HEAP sync last 1000 calls: published={} changed pages={} mean {} us",
+                TOTAL.swap(0, Ordering::Relaxed), PAGES.swap(0, Ordering::Relaxed), NANOS.swap(0, Ordering::Relaxed) / 1_000_000));
+        }
+    }
+
     pub(crate) fn uses_inline_records(&self) -> bool { self.inline }
 
     pub(crate) fn base(&self) -> usize {
@@ -202,11 +361,22 @@ impl Arena {
             let record = InlineDescriptor { source, version, reserved: [0; 2] };
             // The caller validated the destination span through the heap API.
             unsafe { (source as *mut InlineDescriptor).write_unaligned(record) };
+            let mut snapshots = self.registry.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+            if snapshots.is_none() { *snapshots = Snapshots::create(self); }
+            if let Some(kept) = snapshots.as_mut() {
+                let at = Snapshots::slot(version);
+                kept.records[at] = (source, version);
+                self.copy_native_view(kept.handle(at), self.cpu(source));
+            }
         }
     }
 
     fn resolve_inline(&self, record: InlineDescriptor) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         if record.source == 0 || record.version == 0 { return None; }
+        // Match the snapshot first: its contents cannot change under the copy.
+        if let Some(kept) = self.registry.snapshots.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(record)) {
+            return Some(kept);
+        }
         let source = self.registry.find(record.source)?;
         let versions = source.authored.lock().unwrap_or_else(|e| e.into_inner());
         (versions.get(&record.source) == Some(&record.version)).then(|| source.cpu(record.source))
@@ -247,8 +417,22 @@ impl Arena {
             return;
         }
         let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        let Tables { direct, used, ranges, resident_records } = &mut *tables;
-        direct.publish(self, first..end, used);
+        if self.identity != 0 && self.visible != self.staging {
+            static BLOCKS: AtomicU64 = AtomicU64::new(0);
+            for block in first >> 15..=(end - 1) >> 15 {
+                let bit = 1u64 << block.min(63);
+                if BLOCKS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    crate::diagnostics::log(&format!("HEAP block {:#x} of {:#x} first written (slots {first:#x}..{end:#x})", block << 15, self.count));
+                }
+            }
+            let low = end.min(self.identity);
+            if first < low {
+                self.copy(first, first, low - first);
+                for slot in first..low { tables.resident_records.remove(slot as usize); }
+            }
+        }
+        let Tables { direct, used, ranges, resident_records, .. } = &mut *tables;
+        if self.identity == 0 { direct.publish(self, first..end, used); }
         for (&(start, length), &resident) in ranges.iter() {
             if self.inline && self.stride != INLINE_BYTES {
                 let offset = (first as usize).saturating_sub(start as usize) * self.stride / INLINE_BYTES;
@@ -257,7 +441,7 @@ impl Arena {
                     for step in 0..count as usize {
                         let slot = resident as usize + offset + step * (self.stride / INLINE_BYTES);
                         self.copy(first + step as u32, slot as u32, 1);
-                        resident_records.remove(&slot);
+                        resident_records.remove(slot);
                     }
                 }
                 continue;
@@ -269,7 +453,7 @@ impl Arena {
                 self.copy(lo, destination, hi - lo);
                 if self.inline {
                     for slot in destination..destination + hi - lo {
-                        resident_records.remove(&(slot as usize));
+                        resident_records.remove(slot as usize);
                     }
                 }
             }
@@ -282,6 +466,7 @@ impl Arena {
     pub(crate) fn resident_gpu(&self, address: u64, length: u32) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         let offset = (address as usize).checked_sub(self.base())?;
         let first = u32::try_from(offset / self.stride).ok()?;
+        if first.checked_add(length)? <= self.identity { return Some(self.gpu_handle(first)); }
         let tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let slot = tables.ranges.get(&(first, length)).copied().or_else(|| tables.direct.contiguous(first, length))?;
         Some(self.gpu_handle(slot))
@@ -305,11 +490,22 @@ impl Arena {
         }
         let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let key = (first, length);
-        let resident = if let Some(index) = tables.ranges.get(&key) {
+        let resident = if first + length <= self.identity {
+            first
+        } else if let Some(index) = tables.ranges.get(&key) {
             *index
         } else if !self.inline && let Some(index) = tables.direct.contiguous(first, length) {
             index
         } else {
+            if self.identity != 0 && tables.used.checked_add(length).is_none_or(|end| end > self.limit) {
+                // LOCAL: reuse the aliases of long-retired frames from the start.
+                static WRAPS: AtomicU64 = AtomicU64::new(0);
+                let n = WRAPS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() { crate::diagnostics::log(&format!("HEAP aliases recycled ({n} so far, {} tables)", tables.ranges.len())); }
+                tables.used = self.identity;
+                tables.ranges.clear();
+                tables.resident_records.forget_aliases();
+            }
             let index = tables.used;
             let end = index
                 .checked_add(length)
@@ -330,14 +526,23 @@ impl Arena {
                 let cell = address as usize + index * INLINE_BYTES;
                 let record = self.inline_record(cell);
                 let slot = resident as usize + index;
-                if tables.resident_records.get(&slot) == Some(&record) {
+                if tables.resident_records.get(slot) == Some(record) {
                     continue;
                 }
                 let destination = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + slot * self.stride };
                 if let Some(source) = self.resolve_inline(record) {
                     self.copy_native_view(destination, source);
                     materialized += usize::from(record.source != cell || INLINE_BYTES != self.stride);
-                } else if record == InlineDescriptor::default() {
+                } else {
+                    // LOCAL: the title keeps constants in the same memory, so a declared
+                    // entry that the shader never reads can hold anything.
+                    if record != InlineDescriptor::default() {
+                        static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let n = ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() { crate::diagnostics::log(&format!(
+                            "UNRESOLVED table entry {index}/{length} at slot {:#x}, source {:#x} version {} ({n} so far)",
+                            first as usize + index, record.source, record.version)); }
+                    }
                     // Inactive slots have no resource. Use a valid null SRV
                     // rather than copying an uninitialized host descriptor.
                     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -351,15 +556,8 @@ impl Arena {
                     self.placed.copy_to(self.stride, destination.ptr, 0, 1);
                     self.scenes.copy_to(self.stride, destination.ptr, 0, 1);
                     crate::diagnostics::display::texture_view(destination.ptr, None, None);
+                    crate::viewkinds::note(destination.ptr, crate::viewkinds::Kind { tag: "NULL-TEXTURE", ..crate::viewkinds::NONE });
                     unsafe { self.device.CreateShaderResourceView(None, Some(&null), destination) };
-                } else {
-                    if crate::diagnostics::display::trace_views() {
-                        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
-                            "unresolved inline descriptor at {cell:#x}, source {:#x}, version {} (table entry {index}/{length})",
-                            record.source, record.version,
-                        ));
-                    }
-                    return Err(E_INVALIDARG.into());
                 }
                 tables.resident_records.insert(slot, record);
             }
@@ -370,6 +568,14 @@ impl Arena {
         }
         Ok(self.gpu_handle(resident))
     }
+}
+
+/// # Safety
+/// The owner must be the controlling unknown of the live guest device.
+pub(crate) unsafe fn sync_copied(owner: &windows::core::IUnknown) {
+    use windows::core::Interface;
+    let device = unsafe { &*owner.as_raw().cast::<super::Device>() };
+    device.state.descriptor_arenas.sync_copied();
 }
 
 // Keep the logical slot and publish descriptor writes after the host call.

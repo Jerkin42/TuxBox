@@ -69,6 +69,9 @@ pub(super) unsafe extern "system" fn create(
     };
     // GetDesc reflects the size and alignment the driver actually granted.
     let actual = unsafe { native.GetDesc() };
+    if let Ok(object) = native.cast::<ID3D12Object>() {
+        crate::vram::held(&object, || format!("heap/t{} {}K", actual.Properties.Type.0, (actual.SizeInBytes >> 10).next_power_of_two()), actual.SizeInBytes);
+    }
     unsafe { wrap_pageable(Ok(native), &HEAP, device, actual, out) }
 }
 
@@ -132,6 +135,7 @@ pub(super) unsafe extern "system" fn place(
     iid: *const GUID,
     out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("res.place");
     let status = unsafe { check_output::<ID3D12Resource>(iid, out) };
     if status.is_err() {
         return status;
@@ -347,6 +351,7 @@ pub(super) unsafe extern "system" fn place_virtual(
     iid: *const GUID,
     out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("res.virtual");
     let status = unsafe { check_output::<ID3D12Resource>(iid, out) };
     if status.is_err() {
         return status;
@@ -408,6 +413,7 @@ pub(super) unsafe extern "system" fn place_virtual_layout(
     layout: D3D12_BARRIER_LAYOUT, clear: *const D3D12_CLEAR_VALUE,
     iid: *const GUID, out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("res.virtual_layout");
     let status = unsafe { check_output::<ID3D12Resource>(iid, out) };
     if status.is_err() { return status; }
     let Some(desc) = (unsafe { desc.as_ref() }) else { return E_INVALIDARG };
@@ -547,7 +553,12 @@ impl RenderHeaps {
             Flags: if mixed { D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES } else { D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES },
         };
         let mut native = None;
-        unsafe { device.CreateHeap(&desc, &mut native)? };
+        unsafe { device.CreateHeap::<ID3D12Heap>(&desc, &mut native)? };
+        if let Some(native) = &native {
+            if let Ok(object) = windows::core::Interface::cast::<ID3D12Object>(native) {
+                crate::vram::held(&object, || format!("renderheap {}K covers={}", (desc.SizeInBytes >> 10).next_power_of_two(), if stop - start == end - address { "exact" } else { "union" }), desc.SizeInBytes);
+            }
+        }
         let heap = Arc::new(RenderHeap { native: native.ok_or(E_POINTER)?, end: stop });
         heaps.insert(start, Arc::downgrade(&heap));
         Ok((heap, address - start))
@@ -666,6 +677,7 @@ pub(super) unsafe extern "system" fn committed_layout(
     clear: *const D3D12_CLEAR_VALUE, protected: *mut c_void, count: u32,
     formats: *const windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, iid: *const GUID, out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("res.committed");
     let status = unsafe { check_output::<ID3D12Resource>(iid, out) };
     if status.is_err() { return status; }
     let (Some(heap), Some(desc)) = (unsafe { (heap.as_ref(), guest.as_ref()) }) else { return E_INVALIDARG };
@@ -700,6 +712,7 @@ pub(super) unsafe extern "system" fn committed_layout(
         return error.code();
     }
     let Some(native) = native else { return E_POINTER; };
+    crate::vram::resource(&native, "committed3");
     if flags.contains(D3D12_HEAP_FLAG_ALLOW_DISPLAY) {
         crate::diagnostics::display::mark_resource(native.as_raw());
     }
@@ -761,17 +774,21 @@ pub(super) extern "system" fn unregister_pages(device: &Device, token: usize) {
 // Registration returns an opaque cookie. Import the actual slices when a
 // resource uses them, so a large title arena doesn't pin untouched pages.
 #[derive(Default)]
-pub(super) struct PagePools(std::sync::Mutex<std::collections::HashMap<usize, Box<PagePool>>>);
+pub(super) struct PagePools(
+    std::sync::Mutex<std::collections::HashMap<usize, Box<PagePool>>>,
+    // Live imports by (base, size). amdgpu revalidates every userptr import on
+    // each submission, so importing one range many times is very slow there.
+    std::sync::Mutex<std::collections::HashMap<(u64, u64), std::sync::Weak<ImportedHeap>>>,
+);
 
 struct PagePool {
     start: u64,
     end: u64,
-    last_page: Option<(u64, std::sync::Weak<ImportedHeap>)>,
 }
 
 impl PagePools {
     fn register(&self, start: u64, end: u64) -> usize {
-        let pool = Box::new(PagePool { start, end, last_page: None });
+        let pool = Box::new(PagePool { start, end });
         let token = core::ptr::from_ref(pool.as_ref()).addr();
         self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(token, pool);
         token
@@ -779,22 +796,17 @@ impl PagePools {
 
     fn import(&self, device: &ID3D12Device13, base: u64, size: u64, pin: ImportPin) -> windows::core::Result<Arc<ImportedHeap>> {
         let open = || -> windows::core::Result<Arc<ImportedHeap>> {
-            let native = unsafe { device.OpenExistingHeapFromAddress1(base as _, size as usize)? };
+            let native: ID3D12Heap = unsafe { device.OpenExistingHeapFromAddress1(base as _, size as usize)? };
+            if let Ok(object) = native.cast::<ID3D12Object>() {
+                crate::vram::held(&object, || format!("import {}K", (size as u64 >> 10).next_power_of_two()), size as u64);
+            }
             Ok(Arc::new(ImportedHeap { native, _pin: pin }))
         };
-        if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
-            let mut pools = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(pool) = pools.values_mut().find(|pool| pool.start <= base && base + size <= pool.end) {
-                // Nearby suballocations often share one page. The resources
-                // keep their own heap references after this cache advances.
-                if let Some((cached, heap)) = &pool.last_page && *cached == base && let Some(heap) = heap.upgrade() {
-                    return Ok(heap);
-                }
-                let heap = open()?;
-                pool.last_page = Some((base, Arc::downgrade(&heap)));
-                return Ok(heap);
-            }
-        }
-        open()
+        let mut shared = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(heap) = shared.get(&(base, size)).and_then(std::sync::Weak::upgrade) { return Ok(heap); }
+        let heap = open()?;
+        if shared.len() >= 1024 && shared.len().is_power_of_two() { shared.retain(|_, heap| heap.strong_count() != 0); }
+        shared.insert((base, size), Arc::downgrade(&heap));
+        Ok(heap)
     }
 }

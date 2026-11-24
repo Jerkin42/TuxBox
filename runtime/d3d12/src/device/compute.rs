@@ -97,6 +97,7 @@ pub(super) unsafe extern "system" fn create_root_signature(
     iid: *const GUID,
     out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("rootsig");
     // SAFETY: the guest supplies a readable IID and writable output slot.
     let hr = unsafe { check_output::<ID3D12RootSignature>(iid, out) };
     if hr.is_err() {
@@ -149,6 +150,7 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
     iid: *const GUID,
     out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("pso.compute");
     // SAFETY: the guest supplies a readable IID and writable output slot.
     let hr = unsafe { check_output::<ID3D12PipelineState>(iid, out) };
     if hr.is_err() {
@@ -246,7 +248,46 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
         this.native
             .CreateComputePipelineState::<ID3D12PipelineState>(descriptor)
     });
-    let mut native = create(&host);
+    // LOCAL: null named shaders.
+    static SKIP: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| std::env::var("TUXBOX_NULL_SHADERS").unwrap_or_default()
+        .split(',').filter(|s| s.len() == 8).map(str::to_string).collect());
+    let mut native = if SKIP.iter().any(|s| label.ends_with(s.as_str())) {
+        crate::diagnostics::log(&format!("NULLED {label}"));
+        unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
+        return unsafe { null_compute(this, root.map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    } else { create(&host) };
+    let mut reflected = reflected;
+    let mut tried = String::new();
+    if native.is_err() && scene_root.is_none()
+        && let Some(guest) = root
+        && let Some(code) = super::shader_cache::prepared(bytes)
+        && let Some(table) = match super::compute_table::renumbered(&this.native, &guest.state, &[(bytes, 5)], desc.NodeMask) {
+            Ok(TableLayout::Reflected(table)) => Some(table),
+            Ok(_) => { tried = "no renumbered root".into(); None }
+            Err(e) => { tried = format!("renumbered root {:#010x}", e.code().0); None }
+        }
+    {
+        let (root, shader) = (host.pRootSignature.clone(), host.CS);
+        unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
+        host.pRootSignature = ManuallyDrop::new(Some(table.native.clone()));
+        host.CS = D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() };
+        native = create(&host);
+        if native.is_ok() { reflected = Some(table); } else {
+            tried = "renumbered root did not fit".into();
+            unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
+            host.pRootSignature = root;
+            host.CS = shader;
+        }
+    }
+    // LOCAL: name translated programs whose pipeline the host refuses.
+    if let (Err(error), Some(_)) = (&native, &translation) {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+            crate::diagnostics::log(&format!("PSO-FAIL {} {:#010x} layout={} {tried}",
+                super::shader_cache::source_digest(bytes).unwrap_or_default(), error.code().0,
+                if reflected.is_some() { "table" } else { "original" }));
+        }
+    }
     if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err() {
         // Structural checks cannot validate DXIL instructions or root bindings.
         // Let the adapter handle the original guest shader if it rejects the cache.
@@ -265,6 +306,9 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
         crate::diagnostics::log_once(&FIRST, || format!(
             "created compute pipeline with {} reflected FSSM descriptor slots", table.lengths.iter().map(|&v| u64::from(v)).sum::<u64>()
         ));
+    }
+    if let Ok(pipeline) = &native && let Some(hash) = super::shader_cache::source_digest(bytes) {
+        crate::crumbs::name(pipeline.as_raw(), format!("{hash} {}{}{}", super::shader_cache::entry(bytes), if reflected.is_some() { " table" } else { "" }, if translation.is_some() { "" } else { " untranslated" }));
     }
     unsafe {
         wrap_pageable(
@@ -299,6 +343,8 @@ unsafe fn null_compute(
     if native.is_err() { return None; }
     if let Ok(pipeline) = &native {
         let code = unsafe { std::slice::from_raw_parts(desc.CS.pShaderBytecode.cast::<u8>(), desc.CS.BytecodeLength) };
+        crate::crumbs::name(pipeline.as_raw(), format!("NULL {} {}",
+            super::shader_cache::source_digest(code).unwrap_or_default(), super::shader_cache::entry(code)));
         if crate::diagnostics::display::enabled() && let Some(digest) = super::shader_cache::source_digest(code) {
             crate::diagnostics::display::mark_null_compute(pipeline.as_raw(), digest);
         }

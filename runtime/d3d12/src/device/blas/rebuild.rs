@@ -45,7 +45,9 @@ pub(super) fn buffer(
             &mut native,
         )
     }?;
-    native.ok_or_else(|| E_POINTER.into())
+    let native: ID3D12Resource = native.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+    crate::vram::resource(&native, "blas");
+    Ok(native)
 }
 
 pub(super) fn as_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {

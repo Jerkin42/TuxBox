@@ -70,6 +70,7 @@ pub(super) unsafe extern "system" fn ranges(
     src_sizes: *const u32,
     kind: D3D12_DESCRIPTOR_HEAP_TYPE,
 ) {
+    let _span = crate::timing::span("desc.ranges");
     // SetUAVs copies N independent sources to one contiguous destination.
     // A size array can be omitted independently on either side (one per range).
     if (0..D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES.0).contains(&kind.0)
@@ -116,6 +117,7 @@ pub(super) unsafe extern "system" fn simple(
     src: D3D12_CPU_DESCRIPTOR_HANDLE,
     kind: D3D12_DESCRIPTOR_HEAP_TYPE,
 ) {
+    let _span = crate::timing::span("desc.simple");
     if kind == D3D12_DESCRIPTOR_HEAP_TYPE_DSV {
         let stride = unsafe { device.native.GetDescriptorHandleIncrementSize(kind) } as usize;
         device.state.depth_views.copy(

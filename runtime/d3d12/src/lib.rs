@@ -2,6 +2,8 @@
 
 mod big_stack;
 mod commands;
+mod audit;
+mod crumbs;
 mod device;
 mod diagnostics;
 mod exports;
@@ -10,6 +12,9 @@ mod present;
 mod private_driver;
 mod proxy;
 mod survey;
+mod viewkinds;
+mod timing;
+mod vram;
 
 // Guest vtables mix signatures. Each entry is called by its x64 ABI slot.
 macro_rules! slot {

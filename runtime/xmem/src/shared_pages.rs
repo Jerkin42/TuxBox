@@ -69,20 +69,29 @@ impl Section {
         if let Some(h) = self.handle.get() {
             return Ok(h.as_raw_handle());
         }
-        let h = unsafe {
+        let create = |flags| unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 ptr::null(),
-                PAGE_READWRITE | SEC_RESERVE,
+                PAGE_READWRITE | flags,
                 (self.bytes >> 32) as u32,
                 self.bytes as u32,
                 ptr::null(),
             )
         };
+        // Views of a reserve-only section make Wine ask its server which part
+        // is committed on every query. A committed section answers locally.
+        let mut h = create(0);
+        let whole = !h.is_null();
+        if !whole { h = create(SEC_RESERVE); }
         if h.is_null() {
             return Err(unsafe { GetLastError() });
         }
         if self.handle.set(unsafe { OwnedHandle::from_raw_handle(h) }).is_ok() {
+            if whole {
+                self.committed.store(true, Ordering::Release);
+                return Ok(self.handle.get().unwrap().as_raw_handle());
+            }
             let raw = self.handle.get().unwrap().as_raw_handle();
             self.committed.store(commit_whole(raw, self.bytes as usize), Ordering::Release);
         }

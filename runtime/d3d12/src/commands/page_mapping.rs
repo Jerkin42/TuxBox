@@ -130,6 +130,11 @@ impl Mappings {
                 },
             });
         }
+        let live: Vec<[usize; 2]> = imports
+            .values()
+            .filter(|import| self.spans.iter().any(|r| r.start < import.end && import.start < r.end))
+            .map(|i| [i.start as usize, i.end as usize])
+            .collect();
         let mut overlaps = imports
             .values()
             .filter(|import| {
@@ -170,6 +175,22 @@ impl Mappings {
                 }
                 status.ok()?;
             }
+        }
+        if !live.is_empty() {
+            type Keep = unsafe extern "system" fn(u32, *const Batch, u64, u32, *const [usize; 2], usize, *mut [u64; 2]) -> HRESULT;
+            let module = unsafe { GetModuleHandleW(w!("xmem.dll"))? };
+            let keep: Keep = unsafe {
+                std::mem::transmute(GetProcAddress(module, s!("TuxBoxCopyPageMappingsKeepImports")).ok_or(E_NOTIMPL)?)
+            };
+            static STATS: Mutex<[u64; 2]> = Mutex::new([0; 2]);
+            let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+            let before = *stats;
+            unsafe { keep(batches.len() as u32, batches.as_ptr(), self.source, self.pages, live.as_ptr(), live.len(), &mut *stats) }.ok()?;
+
+            if *stats != before {
+                crate::diagnostics::log(&format!("REMAP under live imports: unmaps kept={} replacements={}", stats[0], stats[1]));
+            }
+            return Ok(());
         }
         unsafe {
             (self.apply)(
@@ -318,6 +339,7 @@ pub(super) unsafe extern "system" fn copy(
     pages: u32,
     flags: u32,
 ) -> HRESULT {
+    let _span = crate::timing::span("pagemap.copy");
     let submitted = queue
         .state
         .submission

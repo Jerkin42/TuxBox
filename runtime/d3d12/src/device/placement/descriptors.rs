@@ -24,6 +24,9 @@ pub(crate) struct DescriptorRange<V> {
 }
 
 impl<V: Clone> DescriptorRange<V> {
+    pub(crate) fn sibling(&self, device: &ID3D12Device, heap: &ID3D12DescriptorHeap, desc: &D3D12_DESCRIPTOR_HEAP_DESC) -> Option<Self> {
+        self.views.heap(device, heap, desc, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+    }
     pub(crate) fn copy_to(&self, stride: usize, dst: usize, src: usize, count: u32) {
         self.views.copy(stride, std::iter::once((dst, count)), std::iter::once((src, count)));
     }
@@ -59,6 +62,14 @@ impl<T> Views<T> {
 
 }
 
+/// Textures viewed for the first time, not yet compared with guest memory.
+static FRESH: Mutex<Vec<Weak<super::Texture>>> = Mutex::new(Vec::new());
+
+fn gpu_image(texture: &super::Texture) -> bool {
+    (texture.desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)).0 != 0
+}
+
 #[derive(Clone)]
 pub(crate) struct PlacedView {
     texture: Weak<super::Texture>,
@@ -67,6 +78,9 @@ pub(crate) struct PlacedView {
 
 impl DescriptorMap<PlacedView> {
     pub(crate) fn set(&self, handle: usize, texture: Option<&Arc<super::Texture>>, writable: bool) {
+        if !writable && let Some(texture) = texture && !lock(&texture.contents).checked {
+            lock(&FRESH).push(Arc::downgrade(texture));
+        }
         self.store(handle, texture.map(|t| PlacedView { texture: Arc::downgrade(t), writable }));
     }
 
@@ -74,6 +88,48 @@ impl DescriptorMap<PlacedView> {
         if heaps.is_empty() { return; }
         let views = lock(&self.0);
         for heap in heaps {
+            // LOCAL: a list that indexes the whole heap. The mirrored heap holds every
+            // texture in the title, so take new ones in bounded batches, recheck the rest
+            // in turn, and leave GPU-written images alone.
+            if heap.len() >= 32 * 65536 {
+                // Newly viewed textures are queued by `set`; scan the whole heap only
+                // now and then, for rewrites and for anything that queue missed.
+                static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+                let mut budget = 256u64 << 20;
+                {
+                    let mut fresh = lock(&FRESH);
+                    fresh.retain(|texture| {
+                        let Some(texture) = texture.upgrade() else { return false };
+                        if gpu_image(&texture) || lock(&texture.contents).checked { return false; }
+                        if budget == 0 { return true; }
+                        budget = budget.saturating_sub(texture.size);
+                        reads.push(texture);
+                        false
+                    });
+                }
+                {
+                    let mut last = lock(&LAST);
+                    if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(100)) { continue; }
+                    *last = Some(std::time::Instant::now());
+                }
+                static TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                const TURNS: usize = 512;
+                let turn = TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % TURNS;
+                let mut seen = std::collections::HashSet::new();
+                for (_, view) in views.range(heap.clone()) {
+                    if view.writable { continue; }
+                    let Some(texture) = view.texture.upgrade() else { continue };
+                    if gpu_image(&texture) { continue; }
+                    let key = Arc::as_ptr(&texture) as usize;
+                    if !seen.insert(key) { continue; }
+                    let fresh = !lock(&texture.contents).checked;
+                    if (fresh && budget != 0) || (key >> 6) % TURNS == turn {
+                        budget = budget.saturating_sub(texture.size);
+                        reads.push(texture);
+                    }
+                }
+                continue;
+            }
             for (_, view) in views.range(heap.clone()) {
                 if let Some(texture) = view.texture.upgrade() {
                     if view.writable { writes.push(texture); } else { reads.push(texture); }

@@ -272,6 +272,148 @@ pub(super) fn reflected(
     }
 }
 
+/// Build a root whose parameters keep the title's order and sizes but declare the
+/// registers the stages themselves use. Their registers come from a layout the
+/// compiler numbered separately, and need not appear in the title's root at all.
+pub(super) fn renumbered(
+    device: &ID3D12Device, original: &RootSource, stages: &[(&[u8], u32)], node: u32,
+) -> Result<TableLayout> {
+    use tuxbox_dxbc::compute_table::{Argument, RootUse, root_uses};
+    // LOCAL: leave a stage group on the title's roots, to isolate a fault.
+    static OFF: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("TUXBOX_NO_RENUM").unwrap_or_default());
+    if OFF.contains(if stages[0].1 == 5 { "compute" } else { "raster" }) { return Ok(TableLayout::Unsupported); }
+    let Ok(signature) = parse_rts0(original.payload()) else { return Ok(TableLayout::Unsupported) };
+    if signature.version != 2 { return Ok(TableLayout::Unsupported); }
+    let mut uses: Vec<RootUse> = Vec::new();
+    let mut samplers: Vec<(u32, u32)> = Vec::new();
+    let mut recovered = Vec::new();
+    for &(shader, stage) in stages {
+        let Some((found, sampled)) = root_uses(shader, stage) else { return Ok(TableLayout::Unsupported) };
+        // User SGPRs hold the parameters in order.
+        let mut next = if stage == 5 { 4 } else { 8 };
+        let starts: Vec<u32> = signature.params.iter().map(|p| {
+            let start = next;
+            next += match p.kind { RootParamKind::Table(_) => 1, RootParamKind::Constants { num32, .. } => num32, RootParamKind::Descriptor { .. } => 2 };
+            start
+        }).collect();
+        for found in found {
+            let index = found.parameter as usize;
+            let agrees = signature.params.get(index).is_some_and(|p| match (&p.kind, found.argument) {
+                (RootParamKind::Table(_), Argument::View { .. }) | (RootParamKind::Constants { .. }, Argument::Constants) => true,
+                (RootParamKind::Descriptor { kind, .. }, Argument::Buffer { kind: used }) => *kind == [3, 4, 2][used as usize],
+                _ => false,
+            });
+            if !agrees || starts[index] != found.sgpr { return Ok(TableLayout::Unsupported); }
+            if !uses.contains(&found) { uses.push(found); }
+        }
+        for s in sampled { if !samplers.contains(&s) { samplers.push(s); } }
+        if stage != 1 { recovered.extend(tuxbox_dxbc::inline_sampler::rootless(shader, stage).unwrap_or_default()); }
+    }
+    // One register cannot name two arguments.
+    let class = |a: Argument| match a { Argument::View { kind, .. } | Argument::Buffer { kind } => kind, Argument::Constants => 2 };
+    for (i, a) in uses.iter().enumerate() {
+        if uses[..i].iter().any(|b| class(a.argument) == class(b.argument) && (a.register, a.space) == (b.register, b.space)) {
+            return Ok(TableLayout::Unsupported);
+        }
+    }
+    let bytes = original.serialized();
+    unsafe {
+        let mut reader = None::<ID3D12VersionedRootSignatureDeserializer>;
+        D3D12CreateVersionedRootSignatureDeserializer(
+            bytes.as_ptr().cast(), bytes.len(), &ID3D12VersionedRootSignatureDeserializer::IID, (&raw mut reader).cast(),
+        )?;
+        let reader = reader.ok_or(E_POINTER)?;
+        let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
+        let source = desc.Anonymous.Desc_1_1;
+        if source.NumParameters as usize != signature.params.len() || source.pParameters.is_null() { return Ok(TableLayout::Unsupported); }
+        let mut parameters = std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec();
+        let mut storage: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>> = vec![Vec::new(); parameters.len()];
+        let mut lengths = vec![0u32; parameters.len()];
+        let mut accessed_views = Vec::new();
+        for (index, parameter) in parameters.iter_mut().enumerate() {
+            let used = uses.iter().filter(|u| u.parameter as usize == index);
+            // A parameter no stage reads keeps its place on a register of its own.
+            let spare = 0x7f00 + index as u32;
+            match &signature.params[index].kind {
+                RootParamKind::Table(_) => {
+                    for u in used {
+                        let Argument::View { kind, slot } = u.argument else { continue };
+                        lengths[index] = lengths[index].max(slot + 1);
+                        if kind < 2 { accessed_views.push((index, slot..slot + 1)); }
+                        storage[index].push(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE(kind as i32), NumDescriptors: 1,
+                            BaseShaderRegister: u.register, RegisterSpace: u.space,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: slot,
+                        });
+                    }
+                    if storage[index].is_empty() {
+                        storage[index].push(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV, NumDescriptors: 1, BaseShaderRegister: 0, RegisterSpace: spare,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        });
+                    }
+                    parameter.Anonymous.DescriptorTable = D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: storage[index].len() as u32, pDescriptorRanges: storage[index].as_ptr(),
+                    };
+                }
+                RootParamKind::Constants { num32, .. } => {
+                    let mut registers = used.map(|u| (u.register, u.space));
+                    let (register, space) = registers.next().unwrap_or((0, spare));
+                    if registers.next().is_some() { return Ok(TableLayout::Unsupported); }
+                    parameter.Anonymous.Constants = D3D12_ROOT_CONSTANTS { ShaderRegister: register, RegisterSpace: space, Num32BitValues: *num32 };
+                }
+                RootParamKind::Descriptor { .. } => {
+                    let mut registers = used.map(|u| (u.register, u.space));
+                    let (register, space) = registers.next().unwrap_or((0, spare));
+                    if registers.next().is_some() { return Ok(TableLayout::Unsupported); }
+                    parameter.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR1 { ShaderRegister: register, RegisterSpace: space, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE };
+                }
+            }
+        }
+        // Samplers are inlined into console code, so the title's root need not name them.
+        let mut statics = if source.NumStaticSamplers == 0 { Vec::new() } else { std::slice::from_raw_parts(source.pStaticSamplers, source.NumStaticSamplers as usize).to_vec() };
+        let has = |statics: &Vec<D3D12_STATIC_SAMPLER_DESC>, register, space| statics.iter().any(|s| (s.ShaderRegister, s.RegisterSpace) == (register, space));
+        for s in recovered {
+            if has(&statics, s[10], s[11]) { continue; }
+            statics.push(D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER(s[0] as i32), AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE(s[2] as i32), AddressW: D3D12_TEXTURE_ADDRESS_MODE(s[3] as i32),
+                MipLODBias: f32::from_bits(s[4]), MaxAnisotropy: s[5], ComparisonFunc: D3D12_COMPARISON_FUNC(s[6] as i32),
+                BorderColor: D3D12_STATIC_BORDER_COLOR(s[7] as i32), MinLOD: f32::from_bits(s[8]), MaxLOD: f32::from_bits(s[9]),
+                ShaderRegister: s[10], RegisterSpace: s[11], ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        for (register, space) in samplers {
+            if has(&statics, register, space) { continue; }
+            // LOCAL: the state is in the shader's code; a linear sampler stands in for it.
+            statics.push(D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, MaxLOD: f32::MAX, ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                ShaderRegister: register, RegisterSpace: space, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL, ..Default::default()
+            });
+            static GUESSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = GUESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() { crate::diagnostics::log_once(&std::sync::Once::new(), || format!("ROOT guessed sampler s{register} space{space} ({n} so far)")); }
+        }
+        desc.Anonymous.Desc_1_1.pStaticSamplers = statics.as_ptr();
+        desc.Anonymous.Desc_1_1.NumStaticSamplers = statics.len() as u32;
+        desc.Anonymous.Desc_1_1.pParameters = parameters.as_ptr();
+        let mut blob = None;
+        D3D12SerializeVersionedRootSignature(&desc, &mut blob, None)?;
+        let blob = blob.ok_or(E_POINTER)?;
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize());
+        let native = device.CreateRootSignature(node, bytes)?;
+        static BUILT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() { crate::diagnostics::log_once(&std::sync::Once::new(), || format!("ROOT renumbered {n} roots, last {} parameters", parameters.len())); }
+        Ok(TableLayout::Reflected(Arc::new(ComputeTable {
+            native, original: original.clone(), layout: RootSource::new(bytes), lengths, accessed_views, index_map: None,
+        })))
+    }
+}
+
 /// Keep every embedded range and append FSSM slots the root left out.
 /// Shaders that already translate keep their parameter indexes. The game's
 /// descriptor-table handle still addresses the slot FSSM recorded.

@@ -200,8 +200,14 @@ pub(super) fn pipeline_stream(bytes: usize, error: Option<i32>) {
 }
 
 pub(super) fn recording_error(reason: std::fmt::Arguments<'_>) {
-    static FIRST: Once = Once::new();
-    log_once(&FIRST, || format!("command list cannot record {reason}"));
+    // LOCAL: report each distinct reason once instead of only the first.
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let reason = reason.to_string();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&reason) {
+        log(&format!("command list cannot record {reason}"));
+        seen.push(reason);
+    }
 }
 
 // Multiple pipelines can fail on worker threads during the same frame. Keep a
@@ -324,6 +330,7 @@ pub(crate) mod display {
     }
 
     pub(crate) fn copy_texture_views(dst: usize, src: usize, count: u32, stride: usize) {
+        crate::viewkinds::copy(dst, src, count, stride);
         if !trace_views() { return; }
         let mut map = TEXTURE_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
         for index in 0..count as usize {
@@ -350,7 +357,7 @@ pub(crate) mod display {
 
     pub(crate) fn capture_target(handle: usize, resource: Option<&ID3D12Resource>) {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
-        if !capture_draws() { return; }
+        if !capture_draws() && !crate::present::redirect::enabled() { return; }
         let mut targets = DRAW_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
         targets.remove(&handle);
         if let Some(resource) = resource {
@@ -403,7 +410,7 @@ pub(crate) mod display {
         if !enabled() { return; }
         let Some(digest) = NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).get(&(native as usize)).cloned() else { return };
         let mut seen = NULL_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.len() < 120 && seen.insert((native as usize, groups)) {
+        if seen.len() < 400 && seen.insert((native as usize, [0; 3])) {
             super::log_once(&std::sync::Once::new(), || format!("null compute dispatch CS={digest} groups=({},{},{})", groups[0], groups[1], groups[2]));
         }
     }

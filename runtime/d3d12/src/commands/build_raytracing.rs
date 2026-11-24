@@ -295,7 +295,7 @@ unsafe fn record_builds(
     if !state.can_record(&list.native) || count == 0 {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    let Some(host) = &list.native.part().raytracing else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -312,9 +312,12 @@ unsafe fn record_builds(
     }
     let entries = unsafe { core::slice::from_raw_parts(entries, count as usize) };
     let alignment = u64::from(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    let mut valid = Vec::with_capacity(entries.len());
     for e in entries {
         if e.extension != [0; 4] {
-            state.error = E_NOTIMPL;
+            static EXTENDED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&EXTENDED, || format!(
+                "ignored acceleration structure build call with extension words {:?} (entries={count})", e.extension));
             return;
         }
         let b = &e.build;
@@ -330,8 +333,12 @@ unsafe fn record_builds(
                 .is_multiple_of(alignment)
             || (update && b.SourceAccelerationStructureData == 0)
         {
-            state.error = E_INVALIDARG;
-            return;
+            static SKIPPED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&SKIPPED, || format!(
+                "skipped invalid acceleration structure build type={} descs={} flags={:#x} dest={:#x} scratch={:#x} source={:#x}",
+                b.Inputs.Type.0, b.Inputs.NumDescs, b.Inputs.Flags.0, b.DestAccelerationStructureData,
+                b.ScratchAccelerationStructureData, b.SourceAccelerationStructureData));
+            continue;
         }
         if b.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
             && b.Inputs.NumDescs != 0
@@ -347,12 +354,13 @@ unsafe fn record_builds(
                 return;
             }
         }
+        valid.push(e);
     }
     let Some(owner) = &list.parent else {
         state.error = E_INVALIDARG;
         return;
     };
-    for entry in entries {
+    for entry in valid {
         // One build can need a late-bound instance table, an update-source
         // check, and a destination publication, in that command order.
         if state.scene_commands.try_reserve(3).is_err() {
@@ -373,7 +381,11 @@ unsafe fn record_builds(
             });
         }
         unsafe {
+            let mark = crate::crumbs::begin(&list.native, format!("BVH type={} n={} flags={:x} dest={:x} source={:x} scratch={:x} update={}",
+                build.Inputs.Type.0, build.Inputs.NumDescs, build.Inputs.Flags.0, build.DestAccelerationStructureData, build.SourceAccelerationStructureData,
+                build.ScratchAccelerationStructureData, entry.build.SourceAccelerationStructureData != 0));
             host.BuildRaytracingAccelerationStructure(&build, Some(outputs));
+            crate::crumbs::end(&list.native, mark);
             let guest_va = entry.build.DestAccelerationStructureData;
             let native_va = build.DestAccelerationStructureData;
             let command =

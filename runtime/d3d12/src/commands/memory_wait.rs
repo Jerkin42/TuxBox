@@ -1,4 +1,13 @@
 //! Translate waits on host-visible Series fence words at a native list boundary.
+//! A wait after rendering commands ends the native list. The next command opens
+//! another one with the guest's bindings (native_list, Recording::resume).
+//!
+//! Each boundary is also an ExecuteCommandLists boundary, where D3D12 decays
+//! buffers, simultaneous-access textures, read-only states reached by promotion
+//! and everything on a copy queue to COMMON. Those promote again on use. Explicit
+//! states of other textures, enhanced layouts and acceleration structures persist.
+//! A later guest barrier may name the state from before the decay, as it already
+//! can across guest lists; the fence pair at the boundary flushes the writes.
 //! The game can write markers and sample timestamps before waiting. Keep these
 //! prefix operations ordered without disturbing bindings on the main command list.
 use super::*;
@@ -42,10 +51,16 @@ impl Packet {
 pub(super) struct Prefix {
     pending: Vec<Packet>,
     in_body: bool,
-    pub(super) segments: Vec<Arc<Segment>>,
+    pub(super) ops: Vec<(&'static str, u64, u64)>, // LOCAL: fence trace
+    // The number of native lists that execute before each wait.
+    pub(super) segments: Vec<(usize, Arc<Segment>)>,
 }
 
 impl Prefix {
+    pub(super) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     pub(super) fn push(&mut self, list: &ID3D12GraphicsCommandList, packet: Packet) -> Result<()> {
         if self.in_body {
             return packet.emit(list);
@@ -67,9 +82,46 @@ impl Prefix {
     }
 }
 
+// LOCAL: last value recorded for each fence word, to explain a wait that stalls.
+static WRITES: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, u64)>>> = std::sync::Mutex::new(None);
+pub(super) fn note_write(address: u64, value: u64) {
+    let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = writes.get_or_insert_default();
+    if map.len() < 65536 || map.contains_key(&address) {
+        let entry = map.entry(address).or_default();
+        *entry = (value, entry.1 + 1);
+    }
+}
+
+// LOCAL: every submitted list that touches fence words, dumped when a wait stalls.
+pub(super) struct Submitted { pub(super) queue: usize, pub(super) kind: i32, pub(super) list: usize, pub(super) error: i32,
+    pub(super) outcome: &'static str, pub(super) ops: Vec<(&'static str, u64, u64)> }
+static SUBMITTED: std::sync::Mutex<std::collections::VecDeque<(u64, Submitted)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub(super) fn note_submit(entry: Submitted) {
+    if entry.ops.is_empty() && entry.outcome == "ok" { return; }
+    let n = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut all = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    if all.len() >= 600 { all.pop_front(); }
+    all.push_back((n, entry));
+}
+fn dump_submitted() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let all = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, s) in all.iter() {
+            let ops: Vec<String> = s.ops.iter().take(40).map(|(k, a, v)| format!("{k}:{a:x}={v:x}")).collect();
+            crate::diagnostics::log(&format!("FENCETRACE #{n} q={:x} kind={} list={:x} err={:#x} {} {}",
+                s.queue, s.kind, s.list, s.error, s.outcome, ops.join(" ")));
+        }
+    });
+}
+
 struct Word {
     resource: ID3D12Resource,
     mapped: usize,
+    address: u64,
 }
 
 impl Drop for Word {
@@ -102,6 +154,7 @@ impl Word {
         Ok(Self {
             resource,
             mapped: base.addr() + offset,
+            address,
         })
     }
 
@@ -137,9 +190,20 @@ pub(super) unsafe extern "system" fn wait_value64(
         if target == 0 {
             return Ok(());
         }
-        if state.prefix.in_body {
+        let in_body = state.prefix.in_body;
+        let refused = if !in_body {
+            None
+        } else if state.open_queries != 0 {
+            Some("inside a query")
+        } else if state.split_barriers != 0 {
+            Some("between the halves of a split barrier")
+        } else {
+            None
+        };
+        state.prefix.ops.push((if refused.is_some() { "DROPWAIT" } else if in_body { "midwait" } else { "wait" }, address, target));
+        if let Some(reason) = refused {
             crate::diagnostics::recording_error(format_args!(
-                "GPU memory wait after rendering commands"
+                "GPU memory wait after rendering commands, {reason}"
             ));
             return Err(E_NOTIMPL.into());
         }
@@ -148,6 +212,17 @@ pub(super) unsafe extern "system" fn wait_value64(
             .segments
             .try_reserve(1)
             .map_err(|_| E_OUTOFMEMORY)?;
+        if in_body {
+            // Later markers and waits queue up as at the start of a list until
+            // a command needs the continuation.
+            unsafe { list.native.Close()? };
+            state.parts.parted = true;
+            state.prefix.in_body = false;
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&FIRST, || format!(
+                "split a kind {} list at a GPU memory wait", unsafe { list.native.GetType() }.0
+            ));
+        }
         let prefix = if state.prefix.pending.is_empty() {
             None
         } else {
@@ -168,11 +243,12 @@ pub(super) unsafe extern "system" fn wait_value64(
             }
             Some((native.into(), allocator))
         };
-        state.prefix.segments.push(Arc::new(Segment {
+        let before = state.parts.closed();
+        state.prefix.segments.push((before, Arc::new(Segment {
             prefix,
             word,
             target,
-        }));
+        })));
         Ok(())
     })();
     if let Err(error) = result {
@@ -200,14 +276,32 @@ impl Worker {
             .spawn(move || {
                 for job in jobs {
                     let result = (|| -> Result<()> {
+                        let span = crate::timing::span("wait.prefix");
                         unsafe { job.fence.SetEventOnCompletion(1, HANDLE::default())? };
+                        drop(span);
+                        let span = crate::timing::span("wait.word");
+                        let (mut rounds, mut reports) = (0u32, 0u32);
                         while !job.segment.word.reached(job.segment.target) {
+                            rounds += 1;
+                            if rounds % 3000 == 0 && reports < 4 {
+                                reports += 1;
+                                dump_submitted();
+                                let word = &job.segment.word;
+                                let now = unsafe { AtomicU64::from_ptr(word.mapped as *mut u64).load(Ordering::Acquire) };
+                                let last = WRITES.lock().unwrap_or_else(|e| e.into_inner())
+                                    .as_ref().and_then(|w| w.get(&word.address).copied());
+                                crate::diagnostics::log(&format!(
+                                    "STUCK wait {:#x} >= {:#x}: holds {now:#x}, last recorded write (value, count) {last:x?}",
+                                    word.address, job.segment.target));
+                            }
                             unsafe {
                                 job.device.GetDeviceRemovedReason()?;
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }
+                        drop(span);
                         unsafe { job.fence.Signal(2)?; }
+                        crate::device::placement::TITLE_WAITS.fetch_sub(1, Ordering::AcqRel);
                         static FIRST: std::sync::Once = std::sync::Once::new();
                         crate::diagnostics::log_once(&FIRST, || format!(
                             "GPU memory wait completed target={:#x}", job.segment.target
@@ -273,6 +367,7 @@ pub(super) unsafe fn submit(queue: &Queue, host: &[*mut c_void], splits: Splits)
         unsafe {
             queue.native.Signal(&fence, 1)?;
         }
+        crate::device::placement::TITLE_WAITS.fetch_add(1, Ordering::AcqRel);
         worker
             .0
             .send(Job {

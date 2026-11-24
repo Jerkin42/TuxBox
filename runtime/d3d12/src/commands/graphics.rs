@@ -1,3 +1,4 @@
+use super::native_list::Part;
 use super::{List, parent, recording};
 use crate::device::compute::root_proxy;
 use core::ffi::c_void;
@@ -8,6 +9,53 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{BOOL, Interface};
 
+/// Input assembler, rasterizer and output merger values the guest has recorded.
+/// Unset fields keep the defaults of a newly opened list.
+#[derive(Default)]
+pub(super) struct RasterState {
+    topology: Option<D3D_PRIMITIVE_TOPOLOGY>,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    indices: Option<D3D12_INDEX_BUFFER_VIEW>,
+    vertices: Vec<D3D12_VERTEX_BUFFER_VIEW>,
+    blend: Option<[f32; 4]>,
+    stencil_ref: Option<u32>,
+    depth_bounds: Option<[f32; 2]>,
+    shading_rate: Option<(D3D12_SHADING_RATE, Option<[D3D12_SHADING_RATE_COMBINER; 2]>)>,
+}
+
+impl RasterState {
+    fn vertex_buffers(&mut self, start: u32, views: &[D3D12_VERTEX_BUFFER_VIEW]) {
+        let (start, end) = (start as usize, start as usize + views.len());
+        if self.vertices.len() < end {
+            self.vertices.resize(end, Default::default());
+        }
+        self.vertices[start..end].copy_from_slice(views);
+    }
+
+    pub(super) unsafe fn replay(&self, part: &Part) -> windows::core::Result<()> {
+        let list = &part.list;
+        unsafe {
+            if let Some(topology) = self.topology { list.IASetPrimitiveTopology(topology); }
+            if !self.viewports.is_empty() { list.RSSetViewports(&self.viewports); }
+            if !self.scissors.is_empty() { list.RSSetScissorRects(&self.scissors); }
+            if let Some(view) = &self.indices { list.IASetIndexBuffer(Some(view)); }
+            if !self.vertices.is_empty() { list.IASetVertexBuffers(0, Some(&self.vertices)); }
+            if let Some(factor) = &self.blend { list.OMSetBlendFactor(Some(factor)); }
+            if let Some(reference) = self.stencil_ref { list.OMSetStencilRef(reference); }
+            if let Some([minimum, maximum]) = self.depth_bounds {
+                part.extended().ok_or(windows::Win32::Foundation::E_NOINTERFACE)?
+                    .OMSetDepthBounds(minimum, maximum);
+            }
+            if let Some((rate, combiners)) = &self.shading_rate {
+                list.cast::<ID3D12GraphicsCommandList5>()?
+                    .RSSetShadingRate(*rate, combiners.as_ref().map(|c| c.as_ptr()));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) unsafe extern "system" fn root(list: &List, signature: *mut c_void) {
     let mut state = recording(list);
     if !state.can_record(&list.native) {
@@ -16,8 +64,9 @@ pub(super) unsafe extern "system" fn root(list: &List, signature: *mut c_void) {
     match unsafe { root_proxy(signature, parent(&list.parent)) } {
         Ok(root) => {
             let native = root.map(|r| &r.native);
-            state.bindings.graphics_root(native, root.map(|r| &r.state));
+            let changed = state.bindings.graphics_root(native, root.map(|r| &r.state));
             unsafe { list.native.SetGraphicsRootSignature(native) };
+            if changed && let Some(root) = root { super::compute::bind_zeros::<false>(list, &mut state, &root.state); }
         }
         Err(error) => state.error = error,
     }
@@ -31,6 +80,7 @@ pub(super) unsafe extern "system" fn topology(list: &List, primitive: D3D_PRIMIT
         } else {
             primitive
         };
+        state.raster.topology = Some(native);
         unsafe { list.native.IASetPrimitiveTopology(native) };
     }
 }
@@ -44,6 +94,7 @@ pub(super) unsafe extern "system" fn pipeline(list: &List, guest: *mut c_void) {
         Ok(Some(host)) => {
             state.stencil_slot = host.state.stencil_slot;
             state.null_pipeline = crate::diagnostics::display::is_null_pipeline(host.native.as_raw());
+            if state.null_pipeline { crate::crumbs::null_bound(host.native.as_raw()); }
             state.bindings.pipeline = Some(host.into());
             state.bindings.draw_trace = host.state.draw_trace.clone();
             unsafe { list.native.SetPipelineState(&host.native) };
@@ -67,6 +118,10 @@ pub(super) unsafe extern "system" fn viewports(
         state.error = E_INVALIDARG;
         return;
     }
+    state.raster.viewports.clear();
+    if count != 0 {
+        state.raster.viewports.extend_from_slice(unsafe { core::slice::from_raw_parts(views, count as usize) });
+    }
     unsafe { (list.native.vtable().RSSetViewports)(list.native.as_raw(), count, views) };
 }
 
@@ -80,6 +135,10 @@ pub(super) unsafe extern "system" fn scissors(list: &List, count: u32, rects: *c
     {
         state.error = E_INVALIDARG;
         return;
+    }
+    state.raster.scissors.clear();
+    if count != 0 {
+        state.raster.scissors.extend_from_slice(unsafe { core::slice::from_raw_parts(rects, count as usize) });
     }
     unsafe { (list.native.vtable().RSSetScissorRects)(list.native.as_raw(), count, rects) };
 }
@@ -112,6 +171,17 @@ pub(super) unsafe extern "system" fn targets(
         return;
     }
     state.dsv_bound = !dsv.is_null();
+    if crate::crumbs::on() {
+        state.bound = format!("rt{count}");
+        if let Some(d) = unsafe { dsv.as_ref() } { state.bound += &format!("+d[{}]", crate::audit::view_label(d.ptr)); }
+        for i in 0..count as usize {
+            let name = crate::audit::view_label(unsafe { (*rtvs.add(if contiguous.as_bool() { 0 } else { i })).ptr });
+            state.bound += &format!(" {name}");
+        }
+    }
+    if crate::present::redirect::enabled() && count == 1
+        && let Some(target) = crate::diagnostics::display::draw_target(unsafe { (*rtvs).ptr })
+    { crate::present::redirect::bound(&target); }
     if crate::diagnostics::display::capture_draws() {
         state.trace_target = if count == 1 {
             crate::diagnostics::display::draw_target(unsafe { (*rtvs).ptr })
@@ -126,23 +196,26 @@ pub(super) unsafe extern "system" fn targets(
     }
     let binding = unsafe { dsv.as_ref() }
         .and_then(|h| unsafe { crate::device::stencil::binding(parent(&list.parent), h.ptr) });
-    if let Some((native, surface)) = binding {
-        if state.stencil_targets.is_none() {
-            match super::stencil::Targets::new(native) {
-                Ok(targets) => state.stencil_targets = Some(targets),
-                Err(e) => {
-                    state.error = e.code();
-                    return;
-                }
+    if state.targets.is_none() {
+        let mut device: Option<ID3D12Device> = None;
+        let created = unsafe { list.native.GetDevice(&mut device) }
+            .and_then(|()| super::stencil::Targets::new(device.as_ref().ok_or(E_INVALIDARG)?));
+        match created {
+            Ok(targets) => state.targets = Some(targets),
+            Err(e) => {
+                state.error = e.code();
+                return;
             }
         }
-        if let Some(targets) = &mut state.stencil_targets {
-            unsafe {
-                targets.snapshot(surface, count, rtvs, contiguous.as_bool(), *dsv);
-            }
+    }
+    // The guest may reuse its descriptors before a mid-list wait needs them.
+    if let Some(targets) = &mut state.targets {
+        unsafe {
+            targets.snapshot(
+                binding.map(|(_, surface)| surface),
+                count, rtvs, contiguous.as_bool(), dsv.as_ref().copied(),
+            );
         }
-    } else if let Some(targets) = &mut state.stencil_targets {
-        targets.unbind();
     }
     unsafe {
         (list.native.vtable().OMSetRenderTargets)(
@@ -194,6 +267,7 @@ pub(super) unsafe extern "system" fn shading_rate(
         Ok(native) => native,
         Err(error) => { state.error = error.code(); return; }
     };
+    state.raster.shading_rate = Some((rate, unsafe { combiners.cast::<[D3D12_SHADING_RATE_COMBINER; 2]>().as_ref() }.copied()));
     unsafe { native.RSSetShadingRate(rate, (!combiners.is_null()).then_some(combiners)) };
 }
 
@@ -246,7 +320,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(list: &List, x: u32, y: u32, 
         state.error = E_INVALIDARG;
         return;
     }
-    let Some(native) = list.state.mesh.get_or_init(|| list.native.cast().ok()) else {
+    let Some(native) = list.native.part().mesh() else {
         state.error = windows::Win32::Foundation::E_NOINTERFACE;
         return;
     };
@@ -270,6 +344,7 @@ pub(super) unsafe extern "system" fn index_buffer(
             let Some(address) = super::compute::address(list, &mut state, v.BufferLocation, v.SizeInBytes.into()) else { return; };
             v.BufferLocation = address;
         }
+        state.raster.indices = host;
         unsafe { list.native.IASetIndexBuffer(host.as_ref().map(core::ptr::from_ref)) };
 
     }
@@ -292,6 +367,7 @@ pub(super) unsafe extern "system" fn vertex_buffers(
         return;
     }
     if views.is_null() || count == 0 {
+        state.raster.vertex_buffers(start, &[D3D12_VERTEX_BUFFER_VIEW::default(); D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT as usize][..count as usize]);
         unsafe { (list.native.vtable().IASetVertexBuffers)(list.native.as_raw(), start, count, views) };
         return;
     }
@@ -302,6 +378,7 @@ pub(super) unsafe extern "system" fn vertex_buffers(
         let Some(address) = super::compute::address(list, &mut state, v.BufferLocation, v.SizeInBytes.into()) else { return; };
         v.BufferLocation = address;
     }
+    state.raster.vertex_buffers(start, host);
     unsafe { list.native.IASetVertexBuffers(start, Some(host)) };
 
 }
@@ -330,6 +407,7 @@ pub(super) unsafe extern "system" fn draw_indexed(
 pub(super) unsafe extern "system" fn blend_factor(list: &List, factor: *const f32) {
     let mut state = recording(list);
     if state.can_record(&list.native) {
+        state.raster.blend = unsafe { factor.cast::<[f32; 4]>().as_ref() }.copied();
         unsafe { (list.native.vtable().OMSetBlendFactor)(list.native.as_raw(), factor) };
     }
 }
@@ -337,6 +415,7 @@ pub(super) unsafe extern "system" fn blend_factor(list: &List, factor: *const f3
 pub(super) unsafe extern "system" fn stencil_ref(list: &List, reference: u32) {
     let mut state = recording(list);
     if state.can_record(&list.native) {
+        state.raster.stencil_ref = Some(reference);
         unsafe { list.native.OMSetStencilRef(reference) };
     }
 }
@@ -348,12 +427,11 @@ pub(super) unsafe extern "system" fn depth_bounds(list: &List, minimum: f32, max
     if !state.can_record(&list.native) {
         return;
     }
-    let native = list
-        .state
-        .extended
-        .get_or_init(|| list.native.cast::<ID3D12GraphicsCommandList1>().ok());
-    match native {
-        Some(native) => unsafe { native.OMSetDepthBounds(minimum, maximum) },
+    match list.native.part().extended() {
+        Some(native) => {
+            state.raster.depth_bounds = Some([minimum, maximum]);
+            unsafe { native.OMSetDepthBounds(minimum, maximum) }
+        }
         None => state.error = windows::Win32::Foundation::E_NOINTERFACE,
     }
 }

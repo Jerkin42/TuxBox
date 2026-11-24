@@ -485,7 +485,7 @@ unsafe extern "system" fn create_heap(
             Err(error) => return error.code(),
         }
     };
-    let resident_desc = D3D12_DESCRIPTOR_HEAP_DESC { NumDescriptors: limit, ..*desc };
+    let resident_desc = D3D12_DESCRIPTOR_HEAP_DESC { NumDescriptors: unsafe { native.GetDesc() }.NumDescriptors, ..*desc };
     let placed_views = this.state.placements.views.heap(
         &this.native,
         &native,
@@ -643,6 +643,7 @@ unsafe extern "system" fn create_resource<const EXTENDED: bool>(
     } {
         return error.code();
     }
+    if let Some(native) = &native { crate::vram::resource(native, "committed"); }
     if linear_readback {
         return unsafe { depth::wrap::<true>(this, heap, desc, None, initial, native, out) };
     }

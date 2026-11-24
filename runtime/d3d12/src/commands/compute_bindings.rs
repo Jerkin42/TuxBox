@@ -17,6 +17,8 @@ pub(super) struct Bindings {
     graphics: Option<ID3D12RootSignature>,
     graphics_layout: Option<RootSource>,
     compute_args: BTreeMap<u32, Argument>,
+    /// LOCAL: root buffers the title has not set since the signature changed.
+    pub(super) unset: std::collections::BTreeSet<(bool, u32)>,
     graphics_buffers: BTreeMap<u32, BufferView>,
     graphics_constants: BTreeMap<(u32,u32),u32>,
     graphics_tables: BTreeMap<u32, DescriptorTable>,
@@ -125,22 +127,28 @@ impl Bindings {
         &mut self,
         root: Option<&ID3D12RootSignature>,
         layout: Option<&RootSource>,
-    ) {
-        if self.compute.as_ref() != root {
+    ) -> bool {
+        let changed = self.compute.as_ref() != root;
+        if changed {
+            self.unset.retain(|&(compute, _)| !compute);
             self.compute_args.clear();
             self.layout = layout.cloned();
             self.compute = root.cloned();
         }
+        changed
     }
 
-    pub(super) fn graphics_root(&mut self, root: Option<&ID3D12RootSignature>, layout: Option<&RootSource>) {
-        if self.graphics.as_ref() != root {
+    pub(super) fn graphics_root(&mut self, root: Option<&ID3D12RootSignature>, layout: Option<&RootSource>) -> bool {
+        let changed = self.graphics.as_ref() != root;
+        if changed {
+            self.unset.retain(|&(compute, _)| compute);
             self.graphics_layout = layout.cloned();
             self.graphics_tables.clear();
             self.graphics_constants.clear();
             self.graphics_buffers.clear();
             self.graphics = root.cloned();
         }
+        changed
     }
 
     pub(super) fn heaps(&mut self, heaps: &[Option<ID3D12DescriptorHeap>]) {
@@ -168,6 +176,7 @@ impl Bindings {
     }
 
     pub(super) fn buffer<const COMPUTE: bool>(&mut self, slot: u32, view: BufferView) {
+        self.unset.remove(&(COMPUTE, slot));
         if COMPUTE {
             self.compute_args.insert(slot, Argument::Buffer(view));
         } else {
@@ -213,6 +222,21 @@ impl Bindings {
         }
     }
 
+    // LOCAL: the bound compute arguments, for the progress dump.
+    pub(super) fn describe_compute(&self) -> String {
+        let mut slots: Vec<_> = self.compute_args.iter().collect();
+        slots.sort_by_key(|(slot, _)| **slot);
+        let mut text = String::new();
+        for (slot, arg) in slots {
+            match arg {
+                Argument::Table(t) => text += &format!("[{slot}] table native={:x} logical={:x} ", t.native.ptr, t.logical.ptr),
+                Argument::Buffer(BufferView::Cbv(va) | BufferView::Srv(va) | BufferView::Uav(va)) => text += &format!("[{slot}] view={va:x} "),
+                Argument::Constants(words) => text += &format!("[{slot}] constants={words:x?} "),
+            }
+        }
+        text
+    }
+
     pub(super) fn inline_ranges<const COMPUTE: bool>(&self, slot: usize) -> &[std::ops::Range<u32>] {
         let root = if COMPUTE { &self.layout } else { &self.graphics_layout };
         root.as_ref().map_or(&[], |root| root.inline_ranges(slot))
@@ -223,9 +247,10 @@ impl Bindings {
         root.as_ref()?.paged_tables.as_deref()
     }
 
-    pub(super) fn supports_paged_draw<const COMPUTE: bool>(&self) -> bool {
+    /// `identity`: shader-supplied heap indices already name the right native slots.
+    pub(super) fn supports_paged_draw<const COMPUTE: bool>(&self, identity: bool) -> bool {
         let root = if COMPUTE { &self.layout } else { &self.graphics_layout };
-        root.as_ref().is_some_and(|r| !r.direct_resources && r.paged_tables.is_some())
+        root.as_ref().is_some_and(|r| (identity || !r.direct_resources) && r.paged_tables.is_some())
     }
 
     pub(super) fn graphics_constants(&mut self, slot:u32, first:u32, words:&[u32]) {
@@ -274,13 +299,35 @@ impl Bindings {
             });
         }
         let heap = heap.ok_or(E_INVALIDARG)?;
+        if COMPUTE && crate::viewkinds::on() && let Some(Pipeline::Regular(pso, ..)) = &self.pipeline {
+            let name = crate::crumbs::shader(windows::core::Interface::as_raw(pso));
+            if crate::viewkinds::wanted(&name) {
+                let mut slots = Vec::new();
+                for (index, base) in bases.iter().enumerate() {
+                    let Some(base) = base else { continue };
+                    for slot in table.layout.inline_ranges(index).iter().flat_map(Clone::clone) {
+                        if let Some(range) = heap.table(base.ptr, &(slot..slot + 1)) { slots.push((index, slot, range.start)); }
+                    }
+                }
+                // Table 0 is the title's persistent table; its entries are not inline records.
+                if let Some(Argument::Table(t)) = self.compute_args.get(&0) {
+                    for slot in [1u32, 14, 23] {
+                        if let Some(range) = heap.table(t.native.ptr, &(slot..slot + 1)) { slots.push((0, slot, range.start)); }
+                    }
+                }
+                let (base, count) = match self.compute_args.get(&2) { Some(Argument::Constants(words)) => (words.get(&0).copied().unwrap_or(0), words.get(&1).copied().unwrap_or(0)), _ => (0, 0) };
+                crate::viewkinds::job(&name, &slots, heap.cpu.clone(), heap.table_stride(), base, count);
+            }
+        }
         let index_map = if let Some(binding) = table.index_map {
             // Global indices originate in shader data. Any resident SRV can
             // sample placed textures and needs the usual pre-submit upload.
             super::descriptors::include_range(reads, heap.cpu.clone());
             Some((binding.slot, heap.index_map(guest, arena, resources)?))
         } else {
-            if table.layout.direct_resources {
+            // LOCAL: a mirrored heap holds every texture in the title. Marking all
+            // of them read would upload and shadow each one on every submission.
+            if table.layout.direct_resources && !arena.is_some_and(|arena| arena.is_identity()) {
                 super::descriptors::include_range(reads, heap.cpu.clone());
             }
             for (slot, range) in &table.accessed_views {
@@ -496,6 +543,32 @@ impl Bindings {
             dispatch();
             host.SetComputeRootSignature(self.compute.as_ref());
             self.apply_compute_args(host, &[]);
+        }
+    }
+
+    /// Set every recorded binding on a newly opened list, which starts empty.
+    pub(super) unsafe fn replay(&self, part: &super::native_list::Part) {
+        let host = &part.list;
+        unsafe {
+            if !self.heaps.is_empty() {
+                host.SetDescriptorHeaps(&self.heaps);
+            }
+            if self.compute.is_some() {
+                host.SetComputeRootSignature(self.compute.as_ref());
+                self.apply_compute_args(host, &[]);
+            }
+            if self.graphics.is_some() {
+                host.SetGraphicsRootSignature(self.graphics.as_ref());
+                self.apply_graphics_arguments(host);
+                for (&slot, base) in &self.graphics_tables {
+                    host.SetGraphicsRootDescriptorTable(slot, base.native);
+                }
+            }
+            match (&self.pipeline, &part.raytracing) {
+                (Some(Pipeline::Regular(pso, _, _, _)), _) => host.SetPipelineState(pso),
+                (Some(Pipeline::Ray(pso)), Some(list)) => list.SetPipelineState1(pso),
+                _ => {}
+            }
         }
     }
 

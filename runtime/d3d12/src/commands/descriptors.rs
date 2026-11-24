@@ -135,6 +135,8 @@ pub(super) unsafe extern "system" fn bind_heaps(
     state.resource_heap = resource_heap;
     state.descriptor_arena = descriptor_arena;
     state.bindings.heaps(&retained[..count as usize]);
+    // No list is open after a mid-list wait. Its continuation binds these heaps.
+    if state.parts.parted { return; }
     unsafe {
         (list.native.vtable().SetDescriptorHeaps)(list.native.as_raw(), count, native.as_ptr())
     };

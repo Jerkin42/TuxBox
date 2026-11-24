@@ -10,7 +10,7 @@ pub(super) unsafe extern "system" fn pipeline(list: &List, object: *mut c_void) 
     if !state.can_record(&list.native) {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    let Some(host) = &list.native.part().raytracing else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -32,7 +32,7 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, desc: *const D3D12_DI
     if !state.can_record(&list.native) {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    let Some(host) = &list.native.part().raytracing else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -66,6 +66,8 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, desc: *const D3D12_DI
     }
     state.sample_heap();
     unsafe {
+        let mark = crate::crumbs::begin(&list.native, "DispatchRays".into());
         host.DispatchRays(desc);
+        crate::crumbs::end(&list.native, mark);
     }
 }

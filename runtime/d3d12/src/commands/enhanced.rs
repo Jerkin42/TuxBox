@@ -144,6 +144,27 @@ unsafe fn record(
     Ok(())
 }
 
+unsafe fn track_splits(open: &mut u32, group: &D3D12_BARRIER_GROUP) {
+    macro_rules! track {
+        ($items:ident) => {{
+            let items = unsafe { group.Anonymous.$items };
+            if items.is_null() {
+                return;
+            }
+            for item in unsafe { slice::from_raw_parts(items, group.NumBarriers as usize) } {
+                let split = D3D12_BARRIER_SYNC_SPLIT;
+                track_split(open, item.SyncAfter == split, item.SyncBefore == split);
+            }
+        }};
+    }
+    match group.Type {
+        D3D12_BARRIER_TYPE_GLOBAL => track!(pGlobalBarriers),
+        D3D12_BARRIER_TYPE_BUFFER => track!(pBufferBarriers),
+        D3D12_BARRIER_TYPE_TEXTURE => track!(pTextureBarriers),
+        _ => {}
+    }
+}
+
 pub(super) unsafe extern "system" fn barrier(
     list: &List,
     count: u32,
@@ -157,17 +178,16 @@ pub(super) unsafe extern "system" fn barrier(
         state.error = E_INVALIDARG;
         return;
     }
-    let Some(native) = list
-        .state
-        .enhanced_barriers
-        .get_or_init(|| enhanced_barriers(&list.native))
-    else {
+    let Some(native) = list.native.part().enhanced_barriers() else {
         state.error = E_NOTIMPL;
         return;
     };
-    if let Err(error) =
-        unsafe { record(list, native, slice::from_raw_parts(groups, count as usize)) }
-    {
+    let groups = unsafe { slice::from_raw_parts(groups, count as usize) };
+    let result = unsafe { record(list, native, groups) };
+    for group in groups {
+        unsafe { track_splits(&mut state.split_barriers, group) };
+    }
+    if let Err(error) = result {
         crate::diagnostics::recording_error(format_args!(
             "enhanced resource barrier group ({error:?})"
         ));

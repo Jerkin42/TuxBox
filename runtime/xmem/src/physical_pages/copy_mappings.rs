@@ -76,18 +76,34 @@ impl Pool {
             .try_reserve(updates.len())
             .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
         let mut done = 0;
+        // Entries before this index no longer have their old mapping.
+        let mut cleared = 0;
         let apply = (|| {
             while let Some(first) = updates.get(done) {
+                // Unmap neighbouring pages of one view together. Taking them
+                // one by one would rebuild the rest of the view every time.
+                if done >= cleared && first.old.is_some()
+                    && let Some((&lo, &hi)) = self.views.range(..=first.at).next_back()
+                    && (lo..hi).contains(&first.at)
+                {
+                    let run = updates[done..].iter().enumerate()
+                        .take_while(|(i, e)| e.old.is_some() && e.at == first.at + i * PAGE && e.at < hi).count();
+                    if run > 1 && self.unmap_view_range(first.at, run * PAGE)? { cleared = done + run; }
+                }
+                if done < cleared && first.new.is_none() {
+                    done += 1;
+                    continue;
+                }
                 // A linear source allocation can be represented with one OS
                 // view. Repeated tokens and discontiguous sources use separate
                 // views, so writes remain visible through every alias.
-                if first.old.is_none() && first.new.is_some() {
+                if (first.old.is_none() || done < cleared) && first.new.is_some() {
                     tokens.clear();
                     let mut at = first.at;
                     let region = shared_pages::region(at)?;
                     let region_end = region.BaseAddress.addr() + region.RegionSize;
-                    for entry in &updates[done..] {
-                        if entry.old.is_some() || entry.at != at || at >= region_end {
+                    for (index, entry) in updates.iter().enumerate().skip(done) {
+                        if (entry.old.is_some() && index >= cleared) || entry.at != at || at >= region_end {
                             break;
                         }
                         let Some(token) = entry.new else { break };
@@ -114,7 +130,7 @@ impl Pool {
             Ok(())
         })();
         if let Err(error) = apply {
-            for entry in updates[..done].iter().rev() {
+            for entry in updates[..done.max(cleared)].iter().rev() {
                 self.apply_alias(entry.at, entry.old)?;
             }
             return Err(error);
@@ -237,6 +253,36 @@ unsafe extern "system" fn copy_page_mappings(
         array(batches, count).and_then(|batches| {
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
             let updates = pool.plan_batch(batches, source, pages)?;
+            pool.update_aliases(&updates)
+        })
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => (0x8007_0000 | (error & 0xffff)) as i32,
+    }
+}
+
+// EXPERIMENT: like TuxBoxCopyPageMappings, but pages under a live GPU import are
+// never left unmapped. amdgpu revalidates imports on every submission, so a hole
+// under one fails the submission with EFAULT and loses the device. Reports the
+// kept unmaps and the replacements (which still have a short gap) in `stats`.
+#[unsafe(export_name = "TuxBoxCopyPageMappingsKeepImports")]
+unsafe extern "system" fn copy_page_mappings_keep(
+    count: u32, batches: *const Batch, source: usize, pages: u32,
+    imports: *const [usize; 2], import_count: usize, stats: *mut [u64; 2],
+) -> i32 {
+    let result = unsafe {
+        array(batches, count).and_then(|batches| {
+            let imports = if import_count == 0 { &[][..] } else { slice::from_raw_parts(imports, import_count) };
+            let live = |at: usize| imports.iter().any(|i| at < i[1] && i[0] < at + PAGE);
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let mut updates = pool.plan_batch(batches, source, pages)?;
+            let (mut kept, mut replaced) = (0, 0);
+            updates.retain(|e| {
+                if e.old.is_none() || !live(e.at) { return true; }
+                if e.new.is_none() { kept += 1; false } else { replaced += 1; true }
+            });
+            if !stats.is_null() { (*stats)[0] += kept; (*stats)[1] += replaced; }
             pool.update_aliases(&updates)
         })
     };

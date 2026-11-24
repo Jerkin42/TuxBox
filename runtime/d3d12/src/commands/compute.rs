@@ -3,10 +3,7 @@ use super::{List, parent, recording};
 use crate::device;
 use core::ffi::c_void;
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
-use windows::Win32::Graphics::Direct3D12::{
-    D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION, D3D12_RESOURCE_DIMENSION_BUFFER,
-
-};
+use windows::Win32::Graphics::Direct3D12::*;
 
 pub(super) unsafe extern "system" fn bind_root(list: &List, signature: *mut c_void) {
     let mut state = recording(list);
@@ -18,8 +15,9 @@ pub(super) unsafe extern "system" fn bind_root(list: &List, signature: *mut c_vo
     match unsafe { device::compute::root_proxy(signature, parent(&list.parent)) } {
         Ok(root) => {
             let native = root.map(|r| &r.native);
-            state.bindings.compute_root(native, root.map(|r| &r.state));
+            let changed = state.bindings.compute_root(native, root.map(|r| &r.state));
             unsafe { list.native.SetComputeRootSignature(native) };
+            if changed && let Some(root) = root { bind_zeros::<true>(list, &mut state, &root.state); }
         }
         Err(error) => state.error = error,
     }
@@ -57,10 +55,68 @@ pub(super) unsafe extern "system" fn constants<const COMPUTE: bool>(
 
 use super::compute_bindings::BufferView;
 
+fn zeros(list: &List) -> Option<u64> {
+    static ZEROS: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    let buffer = ZEROS.get_or_init(|| {
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { list.native.GetDevice(&mut device).ok()? };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 16 << 20, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        unsafe {
+            device?.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut out).ok()?;
+        }
+        out
+    });
+    buffer.as_ref().map(|b| unsafe { b.GetGPUVirtualAddress() })
+}
+
+/// A root buffer the title never sets keeps stale push constants, which the GPU follows as a pointer.
+pub(super) fn bind_zeros<const COMPUTE: bool>(list: &List, state: &mut super::Recording, root: &device::compute::RootSource) {
+    if root.root_buffers.is_empty() { return; }
+    let Some(va) = zeros(list) else { return };
+    for &(slot, kind) in root.root_buffers.iter() {
+        let view = match kind { 2 => BufferView::Cbv(va), 3 => BufferView::Srv(va), 4 => BufferView::Uav(va), _ => continue };
+        unsafe { view.apply::<COMPUTE>(&list.native, slot) };
+        state.bindings.buffer::<COMPUTE>(slot, view);
+        state.bindings.unset.insert((COMPUTE, slot));
+    }
+}
+
+pub(super) fn note_unset<const COMPUTE: bool>(state: &super::Recording) {
+    if state.bindings.unset.is_empty() { return; }
+    let slots: Vec<u32> = state.bindings.unset.iter().filter(|&&(c, _)| c == COMPUTE).map(|&(_, s)| s).collect();
+    if slots.is_empty() { return; }
+    static N: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+    let n = N[usize::from(COMPUTE)].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::diagnostics::log(&format!("ROOT-UNSET compute={COMPUTE} slots={slots:?} ({n} so far)"));
+    }
+}
+
 fn root_buffer<const COMPUTE: bool>(list: &List, index: u32, guest: u64, view: fn(u64) -> BufferView) {
     let mut state = recording(list);
     if state.can_record(&list.native) {
-        let Some(address) = address(list, &mut state, guest, 1) else { return };
+        // A host root buffer is a raw pointer: reading a null or unset one faults the
+        // GPU. Bind zeros for an empty slot or an address that cannot be resolved.
+        let resolved = address(list, &mut state, guest, 1).filter(|&va| va != 0);
+        let address = match resolved {
+            Some(va) => va,
+            None => {
+                static EMPTY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = EMPTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::diagnostics::log(&format!(
+                        "ROOT-ZERO compute={COMPUTE} slot={index} guest={guest:#x} error={:#x} ({n} so far)", state.error.0));
+                }
+                let Some(va) = zeros(list) else { return };
+                va
+            }
+        };
         let view = view(address);
         unsafe { view.apply::<COMPUTE>(&list.native, index) };
         state.bindings.buffer::<COMPUTE>(index, view);
@@ -116,6 +172,7 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u3
     if let Some(super::compute_bindings::Pipeline::Regular(pso, ..)) = &state.bindings.pipeline {
         crate::diagnostics::display::null_dispatch(windows::core::Interface::as_raw(pso), [x, y, z]);
     }
+    state.crumb = format!("({x},{y},{z}) ");
     // SAFETY: the native list remains open under its recording lock.
     state.compute_dispatch(list, || unsafe {
         list.native.Dispatch(x, y, z);

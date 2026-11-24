@@ -186,6 +186,7 @@ impl SwapChain {
             frame.list.Reset(&frame.allocator, None)?;
             record_copy(&frame.list, source, &buffer);
             let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
+            let shots = crate::audit::record(&frame.list);
             frame.list.Close()?;
             frame.source = Some(source.clone());
             queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
@@ -197,6 +198,10 @@ impl SwapChain {
             if let Some(sample) = sample {
                 wait_for(&self.fence, self.next)?;
                 sample.report("present");
+            }
+            if !shots.is_empty() {
+                wait_for(&self.fence, self.next)?;
+                for shot in &shots { shot.save(); }
             }
             self.next = next_value;
             // Return DXGI status codes such as DXGI_STATUS_OCCLUDED to the guest.
@@ -414,5 +419,30 @@ pub(crate) mod sampler {
                 crate::diagnostics::log_once(&std::sync::Once::new(), || summary);
             }
         }
+    }
+}
+
+/// EXPERIMENT (idea from NathansDomainSolutions 1cdf9be): present the last bound
+/// full-size render target in place of the display surface. TUXBOX_PRESENT_REDIRECT=1.
+pub(crate) mod redirect {
+    use std::sync::{LazyLock, Mutex};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
+    pub(crate) fn enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_PRESENT_REDIRECT").is_some_and(|v| v == "1"));
+        *ON
+    }
+    static LAST: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+
+    pub(crate) fn bound(target: &ID3D12Resource) {
+        if !enabled() || crate::diagnostics::display::is_display(windows::core::Interface::as_raw(target)) { return; }
+        *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.clone());
+    }
+
+    pub(crate) fn source(display: &ID3D12Resource) -> Option<ID3D12Resource> {
+        if !enabled() { return None; }
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let (a, b) = unsafe { (display.GetDesc(), last.GetDesc()) };
+        (a.Width == b.Width && a.Height == b.Height && a.Format == b.Format).then_some(last)
     }
 }

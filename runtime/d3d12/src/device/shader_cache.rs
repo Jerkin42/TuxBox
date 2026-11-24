@@ -200,6 +200,17 @@ pub(super) fn source_digest(shader: &[u8]) -> Option<String> {
     Some(source)
 }
 
+/// LOCAL: the entry name a console program carries, for logs.
+pub(super) fn entry(shader: &[u8]) -> String {
+    let name = || {
+        let d = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
+        let c = d.chunk(b"DXIL")?;
+        let programs = tuxbox_dxbc::xdat::programs(shader.get(c.offset + 24..c.offset + c.size)?).ok()?;
+        tuxbox_dxbc::fssm::decode(programs.first()?).ok()?.entry
+    };
+    name().map_or("?".into(), |n| n.trim_end_matches("_Wrapped").to_string())
+}
+
 pub(super) fn linked_vertex(vertex: &str, pixel: &str) -> Option<Vec<u8>> {
     read_portable("by_vs_ps", &format!("{vertex}_{pixel}"), Stage::Vertex)
 }

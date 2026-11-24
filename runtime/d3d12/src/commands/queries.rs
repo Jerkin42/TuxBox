@@ -27,8 +27,12 @@ pub(super) unsafe extern "system" fn query<const BEGIN: bool>(
             return;
         }
         unsafe { list.native.BeginQuery(heap, kind, index) };
+        state.open_queries += 1;
     } else {
         unsafe { list.native.EndQuery(heap, kind, index) };
+        if kind != D3D12_QUERY_TYPE_TIMESTAMP {
+            state.open_queries = state.open_queries.saturating_sub(1);
+        }
     }
 }
 
@@ -65,13 +69,33 @@ pub(super) unsafe extern "system" fn resolve(
 
 // A Series timestamp packet writes the queue clock directly to title memory.
 // Desktop D3D12 exposes the same clock through a timestamp query and resolve.
-pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg: u32, flags: u32, mode: u32) {
+// The same entry writes a 64-bit value after earlier work when no timestamp is
+// requested; other queues wait on it.
+pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, value: u64, flush: u32, mode: u32) {
     const SLOTS: u32 = 256;
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
     let result = (|| -> windows::core::Result<()> {
-        if arg != 0 || flags != 0 || mode != 1 || address == 0 || !address.is_multiple_of(8) { return Err(E_INVALIDARG.into()); }
+        if mode > 1 || address == 0 || !address.is_multiple_of(8) || (mode == 1 && (value != 0 || flush != 0)) {
+            crate::diagnostics::recording_error(format_args!(
+                "64-bit write address={address:#x} value={value:#x} flush={flush:#x} mode={mode:#x}"));
+            return Err(E_INVALIDARG.into());
+        }
         let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };
+        if mode == 0 {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&FIRST, || format!(
+                "list slot 72 writes 64-bit value={value:#x} address={address:#x} flush={flush:#x}"));
+            super::memory_wait::note_write(address, value);
+            state.prefix.ops.push(("w64", address, value));
+            if let Some(buffer) = &resource { super::raytracing::retain(&state, &[buffer])?; }
+            // High half first: a waiter never sees a partial, larger value.
+            for (dest, half) in [(gpu + 4, (value >> 32) as u32), (gpu, value as u32)] {
+                state.prefix.push(&list.native, super::memory_wait::Packet::Marker(
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: dest, Value: half }))?;
+            }
+            return Ok(());
+        }
         let resource = resource.ok_or(E_INVALIDARG)?;
         let offset = gpu.checked_sub(unsafe { resource.GetGPUVirtualAddress() }).ok_or(E_INVALIDARG)?;
         super::raytracing::retain(&state, &[&resource])?;

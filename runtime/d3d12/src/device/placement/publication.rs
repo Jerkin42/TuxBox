@@ -46,6 +46,10 @@ pub(crate) struct QueueAccess {
 }
 
 impl QueueAccess {
+    pub(super) fn published_by_this_queue(&self, fence: &ID3D12Fence) -> bool {
+        self.worker.get().is_some_and(|w| &w.published == fence)
+    }
+
     pub(super) fn reader(&self, device: &ID3D12Device) -> Result<&ID3D12Fence> {
         if let Some(fence) = self.reader.get() {
             return Ok(fence);
@@ -96,7 +100,9 @@ impl QueueAccess {
                     if unsafe { job.ready.GetCompletedValue() } == u64::MAX {
                         remember(Err(E_FAIL.into()));
                     } else {
+                        let span = crate::timing::span("rb.complete");
                         let result = job.readback.complete();
+                        drop(span);
                         if result.is_ok() {
                             static FIRST_PUBLICATION: std::sync::Once = std::sync::Once::new();
                             crate::diagnostics::log_once(&FIRST_PUBLICATION, || {

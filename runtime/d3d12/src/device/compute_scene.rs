@@ -87,6 +87,8 @@ pub(crate) struct RootSource {
     bytes: Arc<[u8]>,
     payload: Range<usize>,
     pub(crate) direct_resources: bool,
+    /// Root buffers as (slot, RTS0 kind): 2 CBV, 3 SRV, 4 UAV.
+    pub(crate) root_buffers: Arc<[(u32, u32)]>,
     pub(crate) paged_tables: Option<Arc<[Option<u32>]>>,
     inline_ranges: Arc<[Vec<Range<u32>>]>,
     pub(crate) placed_tables: Option<Arc<[(u32, Range<u32>)]>>,
@@ -105,6 +107,10 @@ impl RootSource {
         let root = tuxbox_dxbc::rootsig::parse_rts0(&bytes[payload.clone()]).ok();
         let placed_tables = root.as_ref().and_then(|root| root.placed_texture_tables());
         let direct_resources = root.as_ref().is_some_and(|root| root.flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0 as u32 != 0);
+        let root_buffers = root.as_ref().map(|signature| signature.params.iter().enumerate().filter_map(|(slot, param)| {
+            let RootParamKind::Descriptor { kind, .. } = &param.kind else { return None; };
+            Some((slot as u32, *kind))
+        }).collect::<Arc<[_]>>()).unwrap_or_default();
         let inline_ranges = root.as_ref().map(|signature| signature.params.iter().map(|param| {
             let RootParamKind::Table(ranges) = &param.kind else { return Vec::new(); };
             let mut next = 0;
@@ -129,6 +135,7 @@ impl RootSource {
             }).collect::<Arc<[_]>>());
         Self {
             direct_resources,
+            root_buffers,
             paged_tables,
             inline_ranges,
             placed_tables: placed_tables.map(Arc::from),

@@ -115,7 +115,9 @@ impl Pair {
                     &mut result,
                 )?
             };
-            result.ok_or_else(|| windows::core::Error::from(E_POINTER))
+            let result: ID3D12Resource = result.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+            crate::vram::resource(&result, "depthpair");
+            windows::core::Result::Ok(result)
         };
         Ok(Self {
             guest: *guest,

@@ -36,7 +36,7 @@ fn is_user(handle: *mut c_void) -> bool {
 // queue handle, context, completion callback, then internal storage.
 
 #[derive(Clone, Copy)]
-enum Payload {
+pub(super) enum Payload {
     Empty,
     User,
     SaveProvider,
@@ -62,7 +62,7 @@ unsafe extern "system" fn deliver(block: *mut c_void, _canceled: bool) {
 }
 
 /// Record a completed operation and run the block's callback on its queue.
-unsafe fn complete(block: *mut c_void, status: i32, size: usize, payload: Payload) -> i32 {
+pub(super) unsafe fn complete(block: *mut c_void, status: i32, size: usize, payload: Payload) -> i32 {
     if block.is_null() {
         return INVALID;
     }
@@ -138,7 +138,7 @@ pub(super) unsafe extern "system" fn async_result_size(_: &Object, block: *mut c
 /// XAsyncCancel (threading slot 5). Every operation here completes at once.
 pub(super) extern "system" fn async_cancel(_: &Object, _block: *mut c_void) {}
 
-fn take(block: *mut c_void) -> Result<Payload, i32> {
+pub(super) fn take(block: *mut c_void) -> Result<Payload, i32> {
     let mut operations = OPERATIONS.lock().unwrap_or_else(|e| e.into_inner());
     match operations.get(&(block as usize)) {
         None => Err(INVALID),
@@ -466,7 +466,7 @@ pub(super) extern "system" fn display_try_hdr(_: &Object, _preference: u32, _inf
 
 static SAVE_PROVIDER: u8 = 0;
 
-fn save_root() -> String {
+pub(super) fn save_root() -> String {
     let path = format!("{}GameSave\\", storage_path());
     let _ = std::fs::create_dir_all(&path);
     path
@@ -503,19 +503,3 @@ pub(super) unsafe extern "system" fn save_initialize_result(_: &Object, block: *
     }
 }
 pub(super) extern "system" fn save_close_provider(_: &Object, _provider: *const u8) {}
-
-/// XGameSaveGetContainerInfo(provider, name, context, callback) (slot 13) and
-/// XGameSaveEnumerateContainerInfo(provider, context, callback) (slot 14):
-/// a fresh profile has no containers, so no callback runs.
-pub(super) unsafe extern "system" fn save_container_info(
-    _: &Object, _provider: *const u8, name: *const i8, _context: *mut c_void, _callback: *mut c_void,
-) -> i32 {
-    let name = if name.is_null() { String::new() } else { unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned() };
-    super::report(format_args!("game save container info for {name:?}: none saved"));
-    OK
-}
-pub(super) unsafe extern "system" fn save_enumerate_containers(
-    _: &Object, _provider: *const u8, _context: *mut c_void, _callback: *mut c_void,
-) -> i32 {
-    OK
-}

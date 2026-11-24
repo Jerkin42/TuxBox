@@ -42,6 +42,7 @@ pub(super) unsafe extern "system" fn cbv(
     desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    let _span = crate::timing::span("view.cbv");
     let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     crate::diagnostics::display::texture_view(handle.ptr, None, None);
     check_destination(handle);
@@ -81,6 +82,10 @@ pub(super) unsafe extern "system" fn cbv(
             }
         }
     }
+    crate::viewkinds::note(handle.ptr, crate::viewkinds::Kind {
+        tag: "cbv", guest: unsafe { desc.as_ref() }.map_or(0, |d| d.BufferLocation), bytes: aligned.map_or(0, |d| u64::from(d.SizeInBytes)),
+        native: if owner.is_some() { aligned.map_or(0, |d| d.BufferLocation) } else { 0 }, ..crate::viewkinds::NONE
+    });
     device.state.imported_views.store(handle.ptr, Some(DescriptorBacking::ConstantBuffer { _address: owner }));
     unsafe {
         device
@@ -128,12 +133,14 @@ impl TextureAddress {
         if base != 0 {
             entry.registry.set(base, Some(&entry));
         }
+        crate::audit::add(native, base as u64, "addr");
         entry
     }
 }
 
 impl Drop for TextureAddress {
     fn drop(&mut self) {
+        crate::audit::remove(&self.native);
         use windows::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
         if self.base != 0 {
             self.registry.remove_if(self.base, self);
@@ -290,14 +297,18 @@ pub(super) unsafe extern "system" fn address_srv(
     desc: &AddressSrv,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    let _span = crate::timing::span("view.address_srv");
     let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     check_destination(handle);
+    let waiting = crate::timing::span("srv.aperture");
     crate::commands::page_mapping::GPU_APERTURE.wait(desc.address,1)
         .unwrap_or_else(|e| fail_call(format_args!("address SRV pending GPU mapping: {:?}", e.code())));
+    drop(waiting);
     let mut view = desc.view;
     let mut byte_view = None;
     let buffer_view = resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
         && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER;
+    let _importing = crate::timing::span(if buffer_view { "srv.buffer" } else { "srv.texture" });
     let imported = if desc.address != 0 && buffer_view {
         let stride = buffer_stride(&view).unwrap_or_else(|| fail_call(format_args!("unsupported address SRV format {}", view.Format.0)));
         let buffer = unsafe { view.Anonymous.Buffer };
@@ -344,6 +355,14 @@ pub(super) unsafe extern "system" fn address_srv(
     device.state.placements.views.set(handle.ptr, placed.as_ref(), false);
     let native = existing.as_ref().map(|e| &e.native).or_else(|| placed.as_ref().map(|p| &p.native)).or_else(|| imported.as_ref().map(|e| &e.native));
     crate::diagnostics::display::texture_view(handle.ptr, native, Some(view.Format.0));
+    {
+        let b = unsafe { desc.view.Anonymous.Buffer };
+        crate::viewkinds::note(handle.ptr, crate::viewkinds::Kind {
+            tag: "srv", guest: desc.address, bytes: resource_desc.Width, format: view.Format.0, dim: view.ViewDimension.0,
+            first: b.FirstElement, count: b.NumElements, stride: b.StructureByteStride,
+            native: native.map_or(0, |n| n.as_raw() as u64),
+        });
+    }
     if let Some((mode, offset, stride)) = byte_view {
         mode.create_srv(device, native.expect("buffer import retained"), view, offset, stride, handle)
             .unwrap_or_else(|e| fail_call(format_args!("byte-offset SRV at {:#x} offset={offset} stride={stride}: {:?}", desc.address, e.code())));
@@ -368,6 +387,7 @@ pub(super) unsafe extern "system" fn address_uav(
     desc: &AddressUav,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    let _span = crate::timing::span("view.address_uav");
     let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     check_destination(handle);
     crate::diagnostics::display::texture_view(handle.ptr, None, None);
@@ -384,6 +404,7 @@ pub(super) unsafe extern "system" fn address_uav(
     };
     if desc.address == 0 || resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
         || view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        crate::viewkinds::note(handle.ptr, crate::viewkinds::Kind { tag: "uav-null", guest: desc.address, ..crate::viewkinds::NONE });
         return null(&view, "not an addressed buffer");
     }
     if crate::commands::page_mapping::GPU_APERTURE.wait(desc.address, 1).is_err() {
@@ -404,6 +425,10 @@ pub(super) unsafe extern "system" fn address_uav(
     view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
     view.Anonymous.Buffer.CounterOffsetInBytes = 0;
     let native = entry.native.clone();
+    crate::viewkinds::note(handle.ptr, crate::viewkinds::Kind {
+        tag: "uav", guest: desc.address, bytes: resource_desc.Width, format: view.Format.0, dim: view.ViewDimension.0,
+        first: buffer.FirstElement, count: buffer.NumElements, stride: buffer.StructureByteStride, native: native.as_raw() as u64,
+    });
     device.state.imported_views.store(handle.ptr, Some(DescriptorBacking::Registered { _address: entry }));
     unsafe { device.native.CreateUnorderedAccessView(&native, None, Some(&view), handle) };
 }
@@ -414,6 +439,7 @@ pub(super) unsafe extern "system" fn srv(
     desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    let _span = crate::timing::span("view.srv");
     let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     let resource = unsafe { view_resource(device, object, desc, handle) };
     let proxy = unsafe { super::resource_proxy(object, identity(device).as_raw()) };
@@ -452,6 +478,12 @@ pub(super) unsafe extern "system" fn srv(
         _ => desc,
     };
     crate::diagnostics::display::texture_view(handle.ptr, resource, unsafe { desc.as_ref() }.map(|view| view.Format.0));
+    crate::viewkinds::note(handle.ptr, unsafe { desc.as_ref() }.map_or(crate::viewkinds::Kind { tag: "srv", ..crate::viewkinds::NONE }, |d| {
+        let b = unsafe { d.Anonymous.Buffer };
+        crate::viewkinds::Kind { tag: "srv", format: d.Format.0, dim: d.ViewDimension.0, first: b.FirstElement, count: b.NumElements,
+            stride: b.StructureByteStride, native: resource.map_or(0, |n| n.as_raw() as u64),
+            guest: resource.map_or(0, |n| unsafe { n.GetGPUVirtualAddress() }), bytes: resource.map_or(0, |n| unsafe { n.GetDesc() }.Width) }
+    }));
     let texture = proxy.and_then(|resource| resource.state.placed());
     let scene = device.state.blas.scene_view(proxy, unsafe { desc.as_ref() });
     device.state.blas.views.store(handle.ptr, scene);
@@ -472,6 +504,7 @@ pub(super) unsafe extern "system" fn uav(
     desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    let _span = crate::timing::span("view.uav");
     let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
     crate::diagnostics::display::texture_view(handle.ptr, None, None);
     let owner = identity(device).as_raw();
@@ -519,6 +552,11 @@ pub(super) unsafe extern "system" fn uav(
         DescriptorBacking::BufferAlias { native: alias.clone(), original: original.clone() }));
     let buffer = unsafe { view_resource(device, object, desc, handle) };
     let buffer = uav_alias.as_ref().map(|(alias, _)| alias).or(buffer);
+    crate::viewkinds::note(handle.ptr, unsafe { desc.as_ref() }.map_or(crate::viewkinds::Kind { tag: "uav", ..crate::viewkinds::NONE }, |d| {
+        let b = unsafe { d.Anonymous.Buffer };
+        crate::viewkinds::Kind { tag: "uav", format: d.Format.0, dim: d.ViewDimension.0, first: b.FirstElement, count: b.NumElements,
+            stride: b.StructureByteStride, native: buffer.map_or(0, |n| n.as_raw() as u64), bytes: buffer.map_or(0, |n| unsafe { n.GetDesc() }.Width), guest: 0 }
+    }));
     let counter = if counter.is_null() {
         None
     } else {
@@ -606,9 +644,11 @@ pub(super) unsafe extern "system" fn rtv(
     desc: *const D3D12_RENDER_TARGET_VIEW_DESC,
     handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
+    let _span = crate::timing::span("view.rtv");
     let resource = unsafe { view_resource(device, object, desc, handle) };
     let proxy = unsafe { super::resource_proxy(object, identity(device).as_raw()) };
     crate::diagnostics::display::capture_target(handle.ptr, resource);
+    crate::audit::view(handle.ptr, resource, 0);
     crate::diagnostics::display::rtv(handle.ptr, proxy.map(|p| p.native.as_raw()));
     device.state.placements.targets.set(handle.ptr, proxy.and_then(|p| p.state.placed()));
     let substitute = proxy.is_some_and(|p| p.state.translated().is_some());
@@ -676,6 +716,7 @@ pub(super) unsafe extern "system" fn dsv(
         }
         _ => desc,
     };
+    crate::audit::view(handle.ptr, resource, 0);
     if super::stencil::needs_emulation(device) {
         let source = unsafe { super::resource_proxy(object, identity(device).as_raw()) };
         let surface = source

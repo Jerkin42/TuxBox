@@ -1,6 +1,7 @@
 //! Snapshot immediate CPU descriptors and surround an emulated stencil-export
 //! draw with copies of just the stencil plane. Both resources return to their
 //! incoming state before control is returned to the guest command list.
+//! The same snapshot binds the targets again after a mid-list wait.
 use super::{CopyLocation, TransitionBarrier};
 use crate::device::stencil::{Mirror, Surface, cpu_heap};
 use core::ptr;
@@ -16,6 +17,8 @@ pub(super) struct Targets {
     handles: [D3D12_CPU_DESCRIPTOR_HANDLE; 8],
     count: usize,
     dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    bound: bool,
+    dsv_bound: bool,
     surface: Option<Arc<Surface>>,
 }
 
@@ -31,21 +34,24 @@ impl Targets {
             handles: Default::default(),
             count: 0,
             dsv,
+            bound: false,
+            dsv_bound: false,
             surface: None,
         })
     }
 
     pub(super) fn unbind(&mut self) {
         self.surface = None;
+        self.bound = false;
     }
 
     pub(super) unsafe fn snapshot(
         &mut self,
-        surface: Arc<Surface>,
+        surface: Option<Arc<Surface>>,
         count: u32,
         rtvs: *const D3D12_CPU_DESCRIPTOR_HANDLE,
         contiguous: bool,
-        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        dsv: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
     ) {
         let stride = unsafe {
             self.device
@@ -53,13 +59,17 @@ impl Targets {
         } as usize;
         let first = unsafe { self.host_rtv.GetCPUDescriptorHandleForHeapStart() }.ptr;
         for i in 0..count as usize {
-            let handle = if contiguous {
+            let handle = if contiguous && unsafe { (*rtvs).ptr } != 0 {
                 D3D12_CPU_DESCRIPTOR_HANDLE {
                     ptr: unsafe { (*rtvs).ptr } + i * stride,
                 }
             } else {
-                unsafe { *rtvs.add(i) }
+                unsafe { *rtvs.add(if contiguous { 0 } else { i }) }
             };
+            if handle.ptr == 0 {
+                self.handles[i] = handle;
+                continue;
+            }
             let copy = D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: first + i * stride,
             };
@@ -69,12 +79,30 @@ impl Targets {
             };
             self.handles[i] = copy;
         }
-        unsafe {
-            self.device
-                .CopyDescriptorsSimple(1, self.dsv, dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
-        };
-        self.surface = Some(surface);
+        let dsv = dsv.filter(|dsv| dsv.ptr != 0);
+        if let Some(dsv) = dsv {
+            unsafe {
+                self.device
+                    .CopyDescriptorsSimple(1, self.dsv, dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
+            };
+        }
+        self.surface = surface;
         self.count = count as usize;
+        self.bound = true;
+        self.dsv_bound = dsv.is_some();
+    }
+
+    pub(super) unsafe fn rebind(&self, list: &ID3D12GraphicsCommandList) {
+        if self.bound {
+            unsafe {
+                list.OMSetRenderTargets(
+                    self.count as u32,
+                    (self.count != 0).then_some(self.handles.as_ptr()),
+                    false,
+                    self.dsv_bound.then_some(core::ptr::from_ref(&self.dsv)),
+                );
+            }
+        }
     }
 
     pub(super) fn draw(

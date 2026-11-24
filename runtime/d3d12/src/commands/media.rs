@@ -37,7 +37,7 @@ impl Recording {
 }
 
 pub(super) static SLOTS: Slots<16> = {
-    let mut s = child_slots::<ID3D12GraphicsCommandList, ListData, 16>();
+    let mut s = child_slots::<super::Native, ListData, 16>();
     s[8] = crate::slot!(super::get_type);
     s[9] = crate::slot!(super::close);
     s[10] = crate::slot!(super::reset);

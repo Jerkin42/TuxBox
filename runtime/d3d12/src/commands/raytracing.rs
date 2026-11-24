@@ -230,7 +230,7 @@ pub(super) unsafe extern "system" fn copy(
     if !state.can_record(&list.native) {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    let Some(host) = &list.native.part().raytracing else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -278,7 +278,7 @@ pub(super) unsafe extern "system" fn postbuild(
     }
     let result = (|| -> Result<()> {
         let desc = unsafe { desc.as_ref() }.ok_or(E_POINTER)?;
-        let host = list.state.raytracing.as_ref().ok_or(E_NOTIMPL)?;
+        let host = list.native.part().raytracing.as_ref().ok_or(E_NOTIMPL)?;
         let owner = list.parent.as_ref().ok_or(E_POINTER)?;
         validate_size_output(desc)?;
         if count == 0 {

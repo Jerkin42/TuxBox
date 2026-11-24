@@ -144,7 +144,7 @@ impl Direct {
 /// The owner must be the controlling unknown of the live guest device.
 pub(crate) unsafe fn index_map(owner: &IUnknown, arena: Option<&Arena>) -> Result<ID3D12Resource> {
     let device = unsafe { &*owner.as_raw().cast::<Device>() };
-    let Some(arena) = arena else {
+    let Some(arena) = arena.filter(|arena| !arena.is_identity()) else {
         let mut identity = device
             .state
             .descriptor_arenas

@@ -13,6 +13,7 @@ use crate::device;
 use crate::device::placement::{self, Texture};
 use crate::present::Presentation;
 use crate::proxy::{Proxy, Slots, allocate, child_slots, unwrap};
+use native_list::Native;
 
 mod build_raytracing;
 pub(crate) use build_raytracing::LIST6;
@@ -24,6 +25,7 @@ mod descriptors;
 mod graphics;
 mod media;
 mod memory_wait;
+mod native_list;
 pub(crate) mod page_mapping;
 mod queries;
 mod ray_dispatch;
@@ -32,19 +34,26 @@ pub(crate) mod serialized_blas;
 mod stencil;
 
 enum ListState {
-    Fresh(ID3D12CommandAllocator, Option<ID3D12PipelineState>),
+    Fresh(Option<ID3D12PipelineState>),
     Open,
     Closed,
 }
 
 struct Recording {
+    allocator: ID3D12CommandAllocator,
+    parts: native_list::Parts,
+    raster: graphics::RasterState,
+    open_queries: u32,
+    split_barriers: u32,
     prefix: memory_wait::Prefix,
     timestamp_page: Option<(ID3D12QueryHeap, u32)>,
     resources: device::MediaResources,
+    crumb: String,
+    bound: String,
     scene_commands: Vec<raytracing::SceneCommand>,
     bindings: compute_bindings::Bindings,
     stencil_slot: Option<u32>,
-    stencil_targets: Option<stencil::Targets>,
+    targets: Option<stencil::Targets>,
     dsv_bound: bool,
     display_bound: bool,
     trace_target: Option<ID3D12Resource>,
@@ -89,16 +98,54 @@ impl Recording {
     }
 
     fn compute_dispatch(&mut self, list: &List, dispatch: impl FnOnce()) {
+        compute::note_unset::<true>(self);
+        static PLAIN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !crate::crumbs::on()
+            && std::env::var_os("TUXBOX_SKIP_CS").is_none() && std::env::var_os("TUXBOX_CS_APART").is_none());
+        if *PLAIN { return self.compute_dispatch_marked(list, dispatch); }
+        let what = match &self.bindings.pipeline {
+            Some(compute_bindings::Pipeline::Regular(pso, scene, table, _)) => format!(
+                "dispatch CS={} scene={} table={}", crate::crumbs::shader(windows::core::Interface::as_raw(pso)), scene.is_some(), table.is_some()),
+            Some(_) => "dispatch on a ray pipeline".into(),
+            None => "dispatch without a pipeline".into(),
+        };
+        let full = std::mem::take(&mut self.crumb) + &what;
+        let before = self.error;
+        // LOCAL: leave out named shaders, and separate async dispatches, to isolate a fault.
+        static SKIP: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| std::env::var("TUXBOX_SKIP_CS").unwrap_or_default()
+            .split(',').filter(|s| s.len() >= 8).map(str::to_string).collect());
+        if !SKIP.is_empty() && what.split("CS=").nth(1).is_some_and(|name| SKIP.iter().any(|s| name.starts_with(s.as_str()))) {
+            static SKIPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() { crate::diagnostics::log(&format!("SKIPPED {n} dispatches, last {full}")); }
+            return;
+        }
+        static APART: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("TUXBOX_CS_APART").is_some());
+        if *APART && unsafe { list.native.GetType() } == D3D12_COMMAND_LIST_TYPE_COMPUTE {
+            let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+            unsafe { list.native.ResourceBarrier(&[barrier]) };
+        }
+        let mark = crate::crumbs::begin(&list.native, full.clone());
+        self.compute_dispatch_marked(list, dispatch);
+        crate::crumbs::detail(mark, || self.bindings.describe_compute());
+        if before.is_ok() && self.error.is_err() {
+            crate::diagnostics::recording_error(format_args!("REFUSED {full}: {:?}", self.error));
+        }
+        crate::crumbs::end(&list.native, mark);
+    }
+
+    fn compute_dispatch_marked(&mut self, list: &List, dispatch: impl FnOnce()) {
         if let Some(table) = self.bindings.reflected_table::<true>() {
             if let Err(error) = self.bindings.with_reflected_table::<true>(
                 table, list, self.descriptor_arena.as_deref(), self.resource_heap.as_ref(),
                 &mut self.sampled_heaps, &self.resources, dispatch,
             ) {
-                self.error = error.code();
+                left_out("dispatch", error.code());
             }
             return;
         }
-        if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<true>() {
+        if let Some(identity) = self.descriptor_arena.as_ref().map(|arena| arena.is_identity())
+            && !self.bindings.supports_paged_draw::<true>(identity)
+        {
             self.error = E_NOTIMPL;
             return;
         }
@@ -144,6 +191,24 @@ impl Recording {
     }
 
     fn draw(&mut self, list: &List, rasterizes: bool, draw: impl FnOnce()) {
+        if !crate::crumbs::on() { return self.draw_marked(list, rasterizes, draw); }
+        static APART: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("TUXBOX_DRAW_APART").is_some());
+        if *APART {
+            let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+            unsafe { list.native.ResourceBarrier(&[barrier]) };
+        }
+        let what = match &self.bindings.pipeline {
+            Some(compute_bindings::Pipeline::Regular(pso, _, _, table)) => format!(
+                "draw {} table={} {}", crate::crumbs::shader(windows::core::Interface::as_raw(pso)), table.is_some(), self.bound),
+            _ => "draw ?".into(),
+        };
+        let mark = crate::crumbs::begin(&list.native, what);
+        self.draw_marked(list, rasterizes, draw);
+        crate::crumbs::end(&list.native, mark);
+    }
+
+    fn draw_marked(&mut self, list: &List, rasterizes: bool, draw: impl FnOnce()) {
+        compute::note_unset::<false>(self);
         if rasterizes {
             crate::diagnostics::display::draw(self.display_bound, self.null_pipeline);
         }
@@ -169,7 +234,7 @@ impl Recording {
             }
         };
         if let Some(table) = self.bindings.reflected_table::<false>() {
-            if self.stencil_slot.is_some() { self.error = E_NOTIMPL; return; }
+            if self.stencil_slot.is_some() { left_out("stencil draw", E_NOTIMPL); return; }
             if let Some(binding) = table.index_map {
                 // These PSOs have one descriptor table followed by one root
                 // constants parameter. The native ISA selects its scalar
@@ -197,7 +262,7 @@ impl Recording {
             if let Err(error) = self.bindings.with_reflected_table::<false>(
                 table, list, self.descriptor_arena.as_deref(), self.resource_heap.as_ref(), &mut self.sampled_heaps, &self.resources, draw,
             ) {
-                self.error = error.code();
+                left_out("draw", error.code());
                 if crate::diagnostics::display::trace_views() {
                     crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
                         "reflected raster binding failed {:#010x} guest RVA {:#x}", self.error.0,
@@ -207,7 +272,9 @@ impl Recording {
             } else { trace(self); }
             return;
         }
-        if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<false>() {
+        if let Some(identity) = self.descriptor_arena.as_ref().map(|arena| arena.is_identity())
+            && !self.bindings.supports_paged_draw::<false>(identity)
+        {
             self.error = E_NOTIMPL;
             return;
         }
@@ -226,7 +293,7 @@ impl Recording {
             && self.dsv_bound
         {
             let status = self
-                .stencil_targets
+                .targets
                 .as_ref()
                 .ok_or_else(|| windows::core::Error::from(E_NOTIMPL))
                 .and_then(|t| t.draw(&list.native, slot, draw));
@@ -252,24 +319,42 @@ impl Recording {
         }
     }
 
-    fn can_record(&mut self, native: &ID3D12GraphicsCommandList) -> bool {
+    // A command that ends the wait prefix. Re-read the current list afterwards:
+    // the first one after a mid-list wait opens its continuation.
+    fn can_record(&mut self, native: &Native) -> bool {
         if !self.ensure_open(native) { return false; }
-        if let Err(error) = self.prefix.finish(native) {
+        if let Err(error) = self.resume(native).and_then(|()| self.prefix.finish(native)) {
             self.error = error.code();
             return false;
         }
         true
     }
 
-    fn ensure_open(&mut self, native: &ID3D12GraphicsCommandList) -> bool {
+    // Continue after a mid-list wait with every binding the guest set so far.
+    fn resume(&mut self, native: &Native) -> windows::core::Result<()> {
+        if !self.parts.parted { return Ok(()); }
+        self.parts.open(native, &self.allocator)?;
+        let part = native.part();
+        unsafe {
+            self.bindings.replay(part);
+            self.raster.replay(part)?;
+            if let Some(targets) = &self.targets { targets.rebind(&part.list); }
+        }
+        Ok(())
+    }
+
+    fn ensure_open(&mut self, native: &Native) -> bool {
         if self.error.is_err() {
-            return false;
+            // LOCAL: execute submits this list anyway, so keep recording after a
+            // failed command. Dropping the rest would lose the markers other
+            // queues wait on (RAGE: "Unsignaled CrossQueueBarrier").
+            return matches!(self.phase, ListState::Open);
         }
         match &self.phase {
-            ListState::Fresh(allocator, initial) => {
+            ListState::Fresh(initial) => {
                 // The factory closed the empty native list to release its allocator.
                 // Reopen with its original bindings when the first operation records.
-                if let Err(error) = unsafe { native.Reset(allocator, initial.as_ref()) } {
+                if let Err(error) = unsafe { native.Reset(&self.allocator, initial.as_ref()) } {
                     self.error = error.code();
                     return false;
                 }
@@ -296,13 +381,9 @@ struct ListData {
     // packet bounds and calls slot 25. Keep them separate from host state.
     pipeline_packets: core::cell::UnsafeCell<[u8; 32]>,
     recording: Mutex<Recording>,
-    extended: OnceLock<Option<ID3D12GraphicsCommandList1>>,
-    enhanced_barriers: OnceLock<Option<ID3D12GraphicsCommandList7>>,
-    mesh: OnceLock<Option<ID3D12GraphicsCommandList6>>,
-    raytracing: Option<ID3D12GraphicsCommandList4>,
 }
 
-type List = Proxy<ID3D12GraphicsCommandList, ListData>;
+type List = Proxy<Native, ListData>;
 const _: () =
     assert!(mem::offset_of!(List, state) + mem::offset_of!(ListData, pipeline_packets) == 0x540);
 const _: () =
@@ -364,7 +445,7 @@ fn translate_batch<T: Default, G, C>(
 }
 
 unsafe extern "system" fn get_type(list: &List) -> D3D12_COMMAND_LIST_TYPE {
-    unsafe { list.native.GetType() }
+    unsafe { list.native.primary().list.GetType() }
 }
 
 unsafe extern "system" fn reset(
@@ -372,6 +453,7 @@ unsafe extern "system" fn reset(
     allocator: *mut c_void,
     initial: *mut c_void,
 ) -> HRESULT {
+    let _span = crate::timing::span("reset");
     let device = parent(&list.parent);
     let Some(allocator) = (unsafe { device::allocator(allocator, device) }) else {
         return E_INVALIDARG;
@@ -385,7 +467,7 @@ unsafe extern "system" fn reset(
     if matches!(state.phase, ListState::Open) {
         return E_FAIL;
     }
-    let native = &list.native;
+    let native = &list.native.primary().list;
     let hr = unsafe {
         (native.vtable().Reset)(
             native.as_raw(),
@@ -395,6 +477,11 @@ unsafe extern "system" fn reset(
     };
     if hr.is_ok() {
         state.phase = ListState::Open;
+        state.allocator = allocator.native.clone();
+        state.parts.rewind(&list.native);
+        state.raster = Default::default();
+        state.open_queries = 0;
+        state.split_barriers = 0;
         state.resources = allocator.state.clone();
         state.timestamp_page = None;
         state.prefix = memory_wait::Prefix::default();
@@ -404,7 +491,7 @@ unsafe extern "system" fn reset(
             state.media = Some(media::Recording::new(allocator));
         }
         state.stencil_slot = initial.and_then(|p| p.state.stencil_slot);
-        if let Some(targets) = &mut state.stencil_targets {
+        if let Some(targets) = &mut state.targets {
             targets.unbind();
         }
         state.dsv_bound = false;
@@ -424,16 +511,23 @@ unsafe extern "system" fn reset(
 }
 
 unsafe extern "system" fn close(list: &List) -> HRESULT {
+    let _span = crate::timing::span("close");
     let mut state = recording(list);
     let mut native_closed = true;
     match state.phase {
         ListState::Closed => return E_FAIL,
         ListState::Fresh(..) => {} // The initial empty recording is already closed on the host.
+        // The recording ends at a wait, whose preceding list is already closed.
+        ListState::Open if state.parts.parted && state.prefix.is_empty() => {}
         ListState::Open => {
-            if let Err(error) = state.prefix.finish(&list.native) { state.error = error.code(); }
-            if let Err(error) = unsafe { list.native.Close() } {
-                state.error = error.code();
-                native_closed = false;
+            if let Err(error) = state.resume(&list.native) { state.error = error.code(); }
+            // A continuation that failed to open leaves nothing to finish.
+            if !state.parts.parted {
+                if let Err(error) = state.prefix.finish(&list.native) { state.error = error.code(); }
+                if let Err(error) = unsafe { list.native.Close() } {
+                    state.error = error.code();
+                    native_closed = false;
+                }
             }
         }
     }
@@ -530,6 +624,7 @@ unsafe extern "system" fn transition(
     count: u32,
     barriers: *const D3D12_RESOURCE_BARRIER,
 ) {
+    let _span = crate::timing::span("rec.transition");
     let mut state = recording(list);
     if !state.can_record(&list.native) || count == 0 {
         return;
@@ -699,12 +794,25 @@ unsafe extern "system" fn transition(
                 }
             }
             submit(&host[first..]);
+            for barrier in host.iter().filter(|b| b.kind == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+                && !b.transition.resource.is_null())
+            {
+                track_split(&mut state.split_barriers,
+                    barrier.transition.flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY,
+                    barrier.transition.flags == D3D12_RESOURCE_BARRIER_FLAG_END_ONLY);
+            }
             Ok(())
         },
     );
     if let Err(error) = result {
         state.error = error;
     }
+}
+
+// Both halves of a split barrier must execute in one ExecuteCommandLists scope.
+fn track_split(open: &mut u32, begins: bool, ends: bool) {
+    if ends { *open = open.saturating_sub(1); }
+    if begins { *open = open.saturating_add(1); }
 }
 
 fn enhanced_barriers(native: &ID3D12GraphicsCommandList) -> Option<ID3D12GraphicsCommandList7> {
@@ -779,11 +887,7 @@ unsafe extern "system" fn extended_cache_barrier(
 }
 
 fn global_cache_barrier(list: &List, state: &mut Recording) {
-    let Some(native) = list
-        .state
-        .enhanced_barriers
-        .get_or_init(|| enhanced_barriers(&list.native))
-    else {
+    let Some(native) = list.native.part().enhanced_barriers() else {
         crate::diagnostics::recording_error(format_args!("enhanced global barriers unavailable"));
         state.error = E_NOTIMPL;
         return;
@@ -1037,6 +1141,7 @@ unsafe extern "system" fn execute_indirect(
     count_buffer: *mut c_void,
     count_offset: u64,
 ) {
+    let _span = crate::timing::span("rec.indirect");
     let mut state = recording(list);
     if !state.can_record(&list.native) {
         return;
@@ -1047,20 +1152,20 @@ unsafe extern "system" fn execute_indirect(
         unsafe { device::indirect::signature(signature, owner) },
         unsafe { device::resource_proxy(arguments, owner) },
     ) else {
-        state.error = E_INVALIDARG;
+        state.error = E_INVALIDARG; crate::diagnostics::recording_error(format_args!("REFUSED ExecuteIndirect at line {} arguments={arguments:p}+{argument_offset:#x} count={count_buffer:p}+{count_offset:#x} max={max_count}", line!()));
         return;
     };
     let bytes = u64::from(signature.state.stride) * u64::from(max_count);
     let Some(argument_offset) = compute::buffer_offset(arguments, argument_offset, bytes) else {
-        state.error = E_INVALIDARG;
+        state.error = E_INVALIDARG; crate::diagnostics::recording_error(format_args!("REFUSED ExecuteIndirect at line {} arguments={arguments:p}+{argument_offset:#x} count={count_buffer:p}+{count_offset:#x} max={max_count}", line!()));
         return;
     };
     let (count, count_offset) = if count_buffer.is_null() { (None, count_offset) } else {
-        let Some(buffer) = (unsafe { device::resource_proxy(count_buffer, owner) }) else { state.error = E_INVALIDARG; return; };
-        let Some(offset) = compute::buffer_offset(buffer, count_offset, 4) else { state.error = E_INVALIDARG; return; };
+        let Some(buffer) = (unsafe { device::resource_proxy(count_buffer, owner) }) else { state.error = E_INVALIDARG; crate::diagnostics::recording_error(format_args!("REFUSED ExecuteIndirect at line {} arguments={arguments:p}+{argument_offset:#x} count={count_buffer:p}+{count_offset:#x} max={max_count}", line!())); return; };
+        let Some(offset) = compute::buffer_offset(buffer, count_offset, 4) else { state.error = E_INVALIDARG; crate::diagnostics::recording_error(format_args!("REFUSED ExecuteIndirect at line {} arguments={arguments:p}+{argument_offset:#x} count={count_buffer:p}+{count_offset:#x} max={max_count}", line!())); return; };
         (Some(&buffer.native), offset)
     };
-    if !(argument_offset | count_offset).is_multiple_of(4) { state.error = E_INVALIDARG; return; }
+    if !(argument_offset | count_offset).is_multiple_of(4) { state.error = E_INVALIDARG; crate::diagnostics::recording_error(format_args!("REFUSED ExecuteIndirect at line {} arguments={arguments:p}+{argument_offset:#x} count={count_buffer:p}+{count_offset:#x} max={max_count}", line!())); return; }
     let execute = || unsafe {
         list.native.ExecuteIndirect(
             &signature.native,
@@ -1082,21 +1187,16 @@ unsafe extern "system" fn execute_indirect(
         state.sample_heap();
     }
     if signature.state.kind == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH {
+        state.crumb = format!("INDIRECT max={max_count} arguments={:x}+{argument_offset:x} counted={} ", windows::core::Interface::as_raw(&arguments.native) as usize, count.is_some());
+        let values = crate::crumbs::arguments(&list.native, &arguments.native, argument_offset, count, count_offset);
+        state.crumb = format!("INDIRECT@{values} ") + &state.crumb;
         state.compute_dispatch(list, execute);
     } else {
+        let values = crate::crumbs::arguments(&list.native, &arguments.native, argument_offset, count, count_offset);
+        let mark = crate::crumbs::begin(&list.native, format!("INDIRECT@{values} kind={} max={max_count} counted={}", signature.state.kind.0, count.is_some()));
         let rasterizes = max_count != 0 && signature.state.kind != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
         state.draw(list, rasterizes, execute);
-    }
-}
-
-// LOCAL: Xbox list slot 61 (title RVA 0x248cbc1) is not identified yet. The
-// title passes (resource, 1, pointer, u32, 16 zero bytes). Log the first calls
-// and record nothing, so the title keeps running.
-unsafe extern "system" fn unknown_61(_list: &List, a: usize, b: u32, c: usize, d: u64, e: u64, f: u64) {
-    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
-            "list slot 61 ignored: a={a:#x} b={b:#x} c={c:#x} d={d:#x} e={e:#x} f={f:#x}"));
+        crate::crumbs::end(&list.native, mark);
     }
 }
 
@@ -1108,14 +1208,15 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
     crate::diagnostics::log_once(&FIRST, || format!(
         "list slot 62 write_bytes source={source:p} address={address:#x} bytes={bytes} flags={flags:#x}"));
     let mut state = recording(list);
-    if !state.ensure_open(&list.native) { return; }
+    // The bytes go to the body, so a later wait must come after them.
+    if !state.can_record(&list.native) { return; }
     if bytes == 0 { return; }
     if source.is_null() || address == 0 || !address.is_multiple_of(4) || !bytes.is_multiple_of(4)
         || bytes > 1 << 20 {
         static BAD: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&BAD, || format!(
             "list slot 62 rejected source={source:p} address={address:#x} bytes={bytes} flags={flags:#x}"));
-        { crate::invalid_site!(); state.error = E_INVALIDARG };
+        state.error = E_INVALIDARG;
         return;
     }
     let result = (|| -> windows::core::Result<()> {
@@ -1134,14 +1235,36 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
     if let Err(error) = result { state.error = error.code(); }
 }
 
+// LOCAL (NathansDomainSolutions bc3ea91): slot 101 is an unidentified
+// (kind, enable) state toggle. Log and ignore.
+unsafe extern "system" fn toggle_101(_list: &List, kind: u32, enable: u32) {
+    static KINDS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    let mut seen = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(kind, enable)) && seen.len() < 16 {
+        seen.push((kind, enable));
+        crate::diagnostics::log_once(&std::sync::Once::new(), || format!("list slot 101 ignored: kind={kind} enable={enable}"));
+    }
+}
+
 // Record the title's four-byte progress marker at the requested GPU address.
-unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, flags: u32, reserved: u32) {
+unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, flush: u32, mode: u32) {
+    let _span = crate::timing::span("rec.marker");
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
-    if address == 0 || !address.is_multiple_of(4) || flags != 0 || reserved != 0 {
+    // `flush` selects cache operations that ordered immediate writes imply.
+    if address == 0 || !address.is_multiple_of(4) || mode != 0 {
+        crate::diagnostics::recording_error(format_args!(
+            "32-bit write address={address:#x} value={value:#x} flush={flush:#x} mode={mode:#x}"));
         state.error = E_INVALIDARG;
         return;
     }
+    if flush != 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST, || format!(
+            "list slot 71 writes 32-bit value={value:#x} address={address:#x} flush={flush:#x}"));
+    }
+    memory_wait::note_write(address, u64::from(value));
+    state.prefix.ops.push(("w32", address, u64::from(value)));
     let result = (|| -> windows::core::Result<()> {
         let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, 4)? };
         if let Some(buffer) = &resource { raytracing::retain(&state, &[buffer])?; }
@@ -1152,7 +1275,7 @@ unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, fl
 }
 
 static LIST_SLOTS: Slots<149> = {
-    let mut slots = child_slots::<ID3D12GraphicsCommandList, ListData, 149>();
+    let mut slots = child_slots::<Native, ListData, 149>();
     slots[8] = crate::slot!(get_type);
     slots[9] = crate::slot!(close);
     slots[10] = crate::slot!(reset);
@@ -1195,7 +1318,9 @@ static LIST_SLOTS: Slots<149> = {
     slots[54] = crate::slot!(depth::clear_uav::<true>);
     slots[55] = crate::slot!(discard);
     slots[59] = crate::slot!(execute_indirect);
-    slots[61] = crate::slot!(unknown_61);
+    // The newer list layout moves this method from 59; GTA VI passes a command
+    // signature, count, argument buffer and 32-byte-spaced offsets here.
+    slots[61] = crate::slot!(execute_indirect);
     slots[62] = crate::slot!(write_bytes);
     slots[67] = crate::slot!(flush_texture_cache);
     slots[68] = crate::slot!(graphics::depth_bounds);
@@ -1232,6 +1357,9 @@ static DEVICE11_LIST_SLOTS: Slots<149> = {
     let mut slots = LIST_SLOTS;
     slots[70] = crate::slot!(graphics::depth_bounds);
     slots[75] = crate::slot!(graphics::force_shader_depth_order);
+    slots[86] = crate::slot!(copy_resource);
+    slots[101] = crate::slot!(toggle_101);
+    slots[129] = crate::slot!(graphics::dispatch_mesh);
     slots[142] = crate::slot!(graphics::sample_mask);
     slots
 };
@@ -1278,12 +1406,19 @@ unsafe extern "system" fn execute(queue: &Queue, count: u32, lists: *const *mut 
 }
 
 unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, frame: Option<(u64,u32)>) {
+    let _span = crate::timing::span(match queue.state.kind.0 { 0 => "exec.direct", 2 => "exec.compute", _ => "exec.copy" });
+    let locking = crate::timing::span("exec.queuelock");
     let mut submitted = queue
         .state
         .submission
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     *submitted = true;
+    drop(locking);
+    if queue.state.placement.error.load(Ordering::Acquire) < 0 && count != 0 {
+        memory_wait::note_submit(memory_wait::Submitted { queue: queue as *const Queue as usize, kind: queue.state.kind.0,
+            list: 0, error: queue.state.placement.error.load(Ordering::Acquire), outcome: "QUEUE-DEAD batch dropped", ops: Vec::new() });
+    }
     if queue.state.placement.error.load(Ordering::Acquire) < 0 || count == 0 {
         return;
     }
@@ -1291,13 +1426,16 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
         reject(queue, E_INVALIDARG);
         return;
     }
+    if let Some(owner) = &queue.parent {
+        let _span = crate::timing::span("exec.heapsync");
+        unsafe { device::descriptor_paging::sync_copied(owner) };
+    }
     let guest = unsafe { slice::from_raw_parts(lists, count as usize) };
-    let mut list_index = 0;
     let trace_samples = std::cell::RefCell::new(Vec::new());
     let result = translate_batch(
         guest,
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), memory_wait::Splits::new()),
-        |&item, (textures, writes, shader_views, scene_lists, splits)| {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), memory_wait::Splits::new()),
+        |&item, (textures, writes, shader_views, scene_lists, natives, splits)| {
             let list: &List = unsafe {
                 unwrap(item, parent(&queue.parent), &LIST_SLOTS)
                     .or_else(|| unwrap(item, parent(&queue.parent), &DEVICE11_LIST_SLOTS))
@@ -1338,8 +1476,15 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                 }
             }
             splits.try_reserve(state.prefix.segments.len()).map_err(|_| E_OUTOFMEMORY)?;
-            splits.extend(state.prefix.segments.iter().map(|s| (list_index, s.clone())));
-            list_index += 1;
+            // Each guest list contributes one or more desktop lists. A wait stands
+            // before the desktop list at its index in the flattened batch.
+            let base = natives.len();
+            splits.extend(state.prefix.segments.iter().map(|(at, s)| (base + at, s.clone())));
+            let lists = state.parts.lists(&list.native);
+            natives.try_reserve(1 + state.parts.closed()).map_err(|_| E_OUTOFMEMORY)?;
+            natives.extend(lists.map(Interface::as_raw));
+            memory_wait::note_submit(memory_wait::Submitted { queue: queue as *const Queue as usize, kind: queue.state.kind.0,
+                list: list as *const List as usize, error: state.error.0, outcome: "ok", ops: state.prefix.ops.clone() });
             if !state.scene_commands.is_empty() {
                 scene_lists.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
                 scene_lists.push(list);
@@ -1354,9 +1499,9 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
             writes.extend(state.placed_writes.iter().cloned());
             shader_views.extend(state.sampled_heaps.iter().cloned());
             trace_samples.borrow_mut().extend(state.trace_samples.iter().cloned());
-            Ok(list.native.as_raw())
+            Ok(())
         },
-        |host, (mut textures, mut writes, shader_views, scene_lists, splits)| {
+        |_, (mut textures, mut writes, shader_views, scene_lists, natives, splits)| {
             unsafe {
                 placement::submit(
                     parent(&queue.parent),
@@ -1380,8 +1525,8 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                                 command.prepare(list)?;
                             }
                         }
-                        memory_wait::submit(queue, host, splits)?;
-                        if !trace_samples.borrow().is_empty() {
+                        memory_wait::submit(queue, &natives, splits)?;
+                        if !trace_samples.borrow().is_empty() && placement::TITLE_WAITS.load(Ordering::Acquire) == 0 {
                             let mut device: Option<ID3D12Device> = None;
                             queue.native.GetDevice(&mut device)?;
                             let device = device.ok_or(E_INVALIDARG)?;
@@ -1404,6 +1549,10 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
         },
     );
     if let Err(error) = result {
+        memory_wait::note_submit(memory_wait::Submitted { queue: queue as *const Queue as usize, kind: queue.state.kind.0,
+            list: 0, error: error.0, outcome: "BATCH-REJECTED (lists above)", ops: Vec::new() });
+        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+            "LOCAL batch rejected kind={} error={:#010x} count={count}", queue.state.kind.0, error.0));
         reject(queue, error);
     } else if let Some((token, flags)) = frame {
         static FIRST: [std::sync::Once;4] = [const { std::sync::Once::new() };4];
@@ -1419,6 +1568,7 @@ unsafe extern "system" fn queue_fence<const WAIT: bool>(
     fence: *mut c_void,
     value: u64,
 ) -> HRESULT {
+    let _span = crate::timing::span("queue_fence");
     let mut submitted = queue
         .state
         .submission
@@ -1464,6 +1614,7 @@ unsafe extern "system" fn signal_x(
     value: u64,
     flush: u32,
 ) -> HRESULT {
+    let _span = crate::timing::span("signal_x");
     if !matches!(flush, 0 | 0x0800_0000) {
         return E_NOTIMPL;
     }
@@ -1506,6 +1657,7 @@ unsafe extern "system" fn present(
     planes: *const PresentPlane,
     params: *const PresentParameters,
 ) -> HRESULT {
+    let _span = crate::timing::span("present");
     let result = unsafe { present_planes(queue, count, planes, params) };
     if result.is_err() {
         static FIRST: std::sync::Once = std::sync::Once::new();
@@ -1583,7 +1735,12 @@ unsafe fn present_planes(
                 desc.Width, desc.Height, full.color_space, full.remaining, params.options));
         }
     }
-    let result = queue.state.presentation.present(&queue.native, source);
+    let redirected = crate::present::redirect::source(source);
+    if redirected.is_some() {
+        static FIRST_REDIRECT: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST_REDIRECT, || "REDIRECT presenting drawn target".into());
+    }
+    let result = queue.state.presentation.present(&queue.native, redirected.as_ref().unwrap_or(source));
     // Frame pacing must advance even if the host present failed; the title
     // otherwise waits forever for this token's flip.
     unsafe { device::frame_events::display_flip(parent(&queue.parent), plane.token) };
@@ -1636,12 +1793,8 @@ pub(crate) unsafe fn wrap_command_list(
     device11: bool,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    let raytracing = if compact {
-        None
-    } else {
-        native.cast::<ID3D12GraphicsCommandList4>().ok()
-    };
-    let has_list4 = raytracing.is_some();
+    let native = Native::new(native, !compact);
+    let has_list4 = native.primary().raytracing.is_some();
     let has_list6 = has_list4 && native.cast::<ID3D12GraphicsCommandList6>().is_ok();
     if extended && !has_list6 {
         return windows::Win32::Foundation::E_NOINTERFACE;
@@ -1653,18 +1806,21 @@ pub(crate) unsafe fn wrap_command_list(
         packet_end: 0,
         reserved2: [0; 0x540 - 0x38],
         pipeline_packets: core::cell::UnsafeCell::new([0; 32]),
-        extended: OnceLock::new(),
-        enhanced_barriers: OnceLock::new(),
-        mesh: OnceLock::new(),
-        raytracing,
         recording: Mutex::new(Recording {
+            allocator: allocator.native.clone(),
+            parts: Default::default(),
+            raster: Default::default(),
+            open_queries: 0,
+            split_barriers: 0,
             timestamp_page: None,
             prefix: memory_wait::Prefix::default(),
             resources: allocator.state.clone(),
+            crumb: String::new(),
+            bound: String::new(),
             scene_commands: Vec::new(),
             bindings: compute_bindings::Bindings::new(initial),
             stencil_slot: initial.and_then(|p| p.state.stencil_slot),
-            stencil_targets: None,
+            targets: None,
             dsv_bound: false,
             display_bound: false,
             trace_target: None,
@@ -1679,7 +1835,7 @@ pub(crate) unsafe fn wrap_command_list(
             scalar_descriptors: Default::default(),
             sampled_heaps: Vec::new(),
             media: compact.then(|| media::Recording::new(allocator)),
-            phase: ListState::Fresh(allocator.native.clone(), initial.map(|p| p.native.clone())),
+            phase: ListState::Fresh(initial.map(|p| p.native.clone())),
             error: S_OK,
         }),
     };
@@ -1752,4 +1908,11 @@ pub(crate) unsafe fn wrap_command_queue(
             out,
         )
     }
+}
+
+/// LOCAL: one draw or dispatch whose tables cannot be bound is left out, instead of losing its whole list.
+fn left_out(what: &str, code: HRESULT) {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() { crate::diagnostics::log_once(&std::sync::Once::new(), || format!("LEFT OUT {n} draws and dispatches, last a {what} {:#010x}", code.0)); }
 }

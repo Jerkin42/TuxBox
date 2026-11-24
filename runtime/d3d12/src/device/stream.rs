@@ -70,6 +70,10 @@ fn stream_label(original: &[Option<(&[u8], Option<usize>)>; 8]) -> String {
         label.push_str(name);
         label.push(' ');
         label.push_str(&hash[..8]);
+        if crate::crumbs::on() {
+            label.push(':');
+            label.push_str(&shader_cache::entry(code));
+        }
     }
     if label.is_empty() { "stream".to_string() } else { label }
 }
@@ -225,7 +229,8 @@ unsafe fn create(
         && original[0].is_none()
         && let Some(table) = super::mesh_table::reflected(
             &device.native, root, mesh, original[1].map(|(pixel, _)| pixel), node_mask,
-        )?
+            // A root that both stages number differently is laid out below.
+        ).or_else(|e| if e.code() == E_NOTIMPL { Ok(None) } else { Err(e) })?
     {
         unsafe { field.write(table.native.as_raw()) };
         pipeline.raster_table = Some(table);
@@ -257,6 +262,7 @@ unsafe fn create(
         super::compute_table::capture_stage_root(pixel, root);
     }
     let mut rooted = [None, None];
+    let mut pipeline_renumbered = false;
     if let Some(root) = guest_root && original[0].is_some() && original[1].is_some()
         && (root_record.is_none() || original[2..].iter().any(Option::is_some))
     {
@@ -278,6 +284,13 @@ unsafe fn create(
             }
             TableLayout::Unsupported => {
                 raster_root_diagnostic(root.payload(), "unsupported table layout");
+                if let Ok(TableLayout::Reflected(table)) = super::compute_table::renumbered(
+                    &device.native, root, &[(vertex, 1), (pixel, 0)], node_mask,
+                ) && shader_cache::prepared(vertex).is_some() && shader_cache::prepared(pixel).is_some() {
+                    unsafe { field.write(table.native.as_raw()) };
+                    pipeline.raster_table = Some(table);
+                    pipeline_renumbered = true;
+                }
                 // Experimental: translate against the guest root unchanged.
                 std::env::var_os("TUXBOX_RASTER_ROOT_FALLBACK").map(|_| root)
             }
@@ -369,10 +382,20 @@ unsafe fn create(
         pPipelineStateSubobjectStream: output.cast(),
     };
     let label = stream_label(&original);
+    // LOCAL: null named raster shaders, to get past a faulting draw.
+    static SKIP: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| std::env::var("TUXBOX_NULL_SHADERS").unwrap_or_default()
+        .split(',').filter(|s| s.len() == 8).map(str::to_string).collect());
+    if SKIP.iter().any(|s| label.contains(s.as_str())) {
+        crate::diagnostics::log(&format!("NULLED {label}"));
+        return unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, &label) }.unwrap_or(Err(E_NOTIMPL.into()));
+    }
     // SAFETY: the stream storage, translated shaders, and guest-owned inputs
     // all stay alive throughout this synchronous call on the desktop Device2.
-    let initial = crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState(&native_desc) });
+    let initial = crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState::<ID3D12PipelineState>(&native_desc) });
     let Err(error) = &initial else {
+        if let Ok(pipeline) = &initial {
+            crate::crumbs::name(pipeline.as_raw(), label.clone() + if pipeline_renumbered { " RENUM" } else { "" });
+        }
         if rectangles {
             static FIRST_RECTANGLE: std::sync::Once = std::sync::Once::new();
             crate::diagnostics::log_once(&FIRST_RECTANGLE, || {
@@ -398,6 +421,39 @@ unsafe fn create(
         return initial;
     };
     let status = error.code();
+    // LOCAL: lay the root out from the shaders themselves, mesh stages included.
+    let kinds: Vec<(usize, u32)> = [(0, 1), (1, 0), (6, 14), (7, 13)].into_iter().filter(|&(i, _)| original[i].is_some()).collect();
+    let mut tried = String::new();
+    if status == E_INVALIDARG && !pipeline_renumbered && rooted.iter().all(Option::is_none)
+        && original[2..6].iter().all(Option::is_none) && original[5].is_none()
+        && kinds.iter().all(|&(i, _)| original[i].is_some_and(|(_, stage)| stage.is_some()))
+        && let (Some(root), Some(field)) = (guest_root, root_record)
+    {
+        let stages: Vec<(&[u8], u32)> = kinds.iter().filter_map(|&(i, kind)| original[i].map(|(code, _)| (code, kind))).collect();
+        match super::compute_table::renumbered(&device.native, root, &stages, node_mask) {
+            Ok(super::compute_table::TableLayout::Reflected(table)) => {
+                let kept = unsafe { field.read() };
+                unsafe { field.write(table.native.as_raw()) };
+                let retry = crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState::<ID3D12PipelineState>(&native_desc) });
+                if let Ok(native) = &retry {
+                    pipeline.raster_table = Some(table);
+                    crate::crumbs::name(native.as_raw(), label.clone() + " RENUM2");
+                    return retry;
+                }
+                unsafe { field.write(kept) };
+                tried = "renumbered root did not fit".into();
+            }
+            Ok(_) => tried = "no renumbered root".into(),
+            Err(e) => tried = format!("renumbered root {:#010x}", e.code().0),
+        }
+    }
+    {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let state: String = original.iter().flatten().map(|(_, s)| if s.is_some() { 'P' } else { '-' }).collect();
+        if !state.contains('-') && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 500 {
+            crate::diagnostics::log(&format!("PSO-FAIL raster {label} {state} {:#010x} {tried}", status.0));
+        }
+    }
     if let (Some(pixel), Some(root)) = (guest_pixel, guest_root) {
         super::compute_table::capture_stage_root(pixel, root);
     }
@@ -470,10 +526,10 @@ unsafe fn create(
             Err(error) => crate::diagnostics::pipeline_stages(&hashes, error.code().0, true),
         }
         if retry.is_ok() { return retry; }
-        return unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record) }.unwrap_or(retry);
+        return unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, &label) }.unwrap_or(retry);
     }
     crate::diagnostics::pipeline_stages(&hashes, status.0, false);
-    unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record) }.unwrap_or(initial)
+    unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, &label) }.unwrap_or(initial)
 }
 
 /// Retry a rejected stream with resource-free shaders (see `fallback`). Mesh
@@ -484,6 +540,7 @@ unsafe fn null_pipeline(
     fields: &[Option<*mut D3D12_SHADER_BYTECODE>; 8],
     stream_output: bool,
     geometry: *mut D3D12_SHADER_BYTECODE,
+    label: &str,
 ) -> Option<windows::core::Result<ID3D12PipelineState>> {
     use super::fallback::{Stage, bytecode, enabled, shader, substituted};
     if !enabled() || stream_output || fields[6].is_some() || fields[7].is_some() {
@@ -512,6 +569,7 @@ unsafe fn null_pipeline(
     let result = unsafe { host.CreatePipelineState::<ID3D12PipelineState>(desc) };
     if let Ok(pipeline) = &result {
         crate::diagnostics::display::mark_null_pipeline(pipeline.as_raw());
+        crate::crumbs::name(pipeline.as_raw(), format!("NULL {label}"));
         substituted(if compute { "compute stream" } else { "raster stream" });
     }
     Some(result)
@@ -523,6 +581,7 @@ pub(super) unsafe extern "system" fn create_pipeline(
     iid: *const GUID,
     out: Out,
 ) -> HRESULT {
+    let _span = crate::timing::span("pso.stream");
     let status = unsafe { check_output::<ID3D12PipelineState>(iid, out) };
     if status.is_err() {
         return status;

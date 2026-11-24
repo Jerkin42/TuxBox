@@ -10,6 +10,7 @@ pub(super) struct Change {
     pub(super) texture: Arc<Texture>,
     pub(super) level: usize,
     pub(super) bytes: Vec<u8>,
+    pub(super) print: [u64; 2],
 }
 
 // These COM objects must survive the asynchronous copy, even if the guest
@@ -67,13 +68,33 @@ impl Transfer {
         {
             self.pending.pop_front();
         }
-        let mut changes = Vec::new();
+        let mut changes: Vec<Change> = Vec::new();
+        let mut bytes = 0;
         for texture in textures {
-            texture.changed(&mut changes, &mut self.scratch)?;
+            let first = changes.len();
+            {
+                let _span = crate::timing::span("up.compare");
+                texture.changed(&mut changes, &mut self.scratch)?;
+            }
+            bytes += changes[first..].iter().map(|change: &Change| change.bytes.len()).sum::<usize>();
+            // Each batch needs its bytes twice: as read, and in an upload buffer.
+            if bytes >= 128 << 20 {
+                self.flush(device, std::mem::take(&mut changes))?;
+                bytes = 0;
+                // LOCAL: let the copies drain before staging more.
+                let mut waited = 0;
+                while self.pending.len() > 3 && waited < 1000 {
+                    let completed = unsafe { self.fence.GetCompletedValue() };
+                    while self.pending.front().is_some_and(|(tick, _)| *tick <= completed) { self.pending.pop_front(); }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    waited += 1;
+                }
+            }
         }
-        if changes.is_empty() {
-            return Ok(());
-        }
+        if changes.is_empty() { Ok(()) } else { self.flush(device, changes) }
+    }
+
+    fn flush(&mut self, device: &ID3D12Device, changes: Vec<Change>) -> Result<()> {
         if crate::diagnostics::display::trace_views() {
             for change in &changes {
                 let desc = change.texture.desc;
@@ -87,13 +108,14 @@ impl Transfer {
                 }
             }
         }
+        let _span = crate::timing::span("up.flush");
         let upload = Upload::record(device, &changes)?;
         for mips in changes.chunk_by(|a, b| Arc::ptr_eq(&a.texture, &b.texture)) {
             // A guest may use a different queue on each submission. Order
             // replacement writes after every outstanding reader of this texture.
             let contents = lock(&mips[0].texture.contents);
             for (fence, value) in &contents.readers {
-                if unsafe { fence.GetCompletedValue() } < *value {
+                if unsafe { fence.GetCompletedValue() } < *value && !super::ordered_by_title("upload") {
                     unsafe {
                         self.queue.Wait(fence, *value)?;
                     }
@@ -112,7 +134,8 @@ impl Transfer {
         }
         for change in changes {
             let mut state = lock(&change.texture.contents);
-            self.scratch = std::mem::replace(&mut state.previous[change.level], change.bytes);
+            state.previous[change.level] = Some(change.print);
+            if change.bytes.capacity() <= 64 << 20 { self.scratch = change.bytes; }
             state.uploaded = tick;
             state.readers.clear();
         }

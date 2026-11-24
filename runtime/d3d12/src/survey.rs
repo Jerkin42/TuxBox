@@ -34,8 +34,21 @@ pub(crate) fn enabled() -> bool {
 /// ProjectScarlett 1.0.2.1, RVA `0x4ffd879`: the tile-heap mapper asserts when a
 /// request is shorter than a whole flagged page run (8 KiB against a 16 KiB
 /// run). The continue path maps `min(run, remaining)`, which is the request.
-const RECOVERABLE: [(usize, [u8; 9]); 1] =
-    [(0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff])];
+///
+/// LOCAL (2901814): the same loop's other asserts; may map wrong pages.
+const RECOVERABLE: [(usize, [u8; 9]); 5] = [
+    // LOCAL: an entity pool of 131,071 is full; the title returns null and its caller handles it.
+    (0x5149aec, [0xcc, 0x31, 0xff, 0x48, 0x89, 0xf8, 0x48, 0x83, 0xc4]),
+    (0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff]),
+    (0x4ffd859, [0xcc, 0xe9, 0xa5, 0xfd, 0xff, 0xff, 0xcc, 0x48, 0x8b]),
+    (0x4ffd85f, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xc1, 0xfd, 0xff, 0xff]),
+    (0x4ffd868, [0xcc, 0x48, 0x8b, 0x1f, 0x89, 0xda, 0x81, 0xe2, 0x00]),
+];
+
+/// LOCAL (28a5e27): the tile-run counter at 0x51d2470 asserts when the bytes to
+/// cover outlast the page-run table. Count the remainder as one run and return.
+const RUN_COUNT: (usize, usize, [u8; 9]) =
+    (0x51d251e, 0x51d250e, [0xcc, 0xeb, 0xc5, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
 
 fn is_recoverable(rva: usize, bytes: &[u8]) -> bool {
     RECOVERABLE.iter().any(|&(site, expected)| rva == site && bytes == expected)
@@ -115,6 +128,20 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     } else {
         return CONTINUE_SEARCH;
     };
+    {
+        let (rva, ret, bytes) = RUN_COUNT;
+        // SAFETY: both ranges are inside the mapped title image.
+        if int3 == start + rva && int3 + 9 <= end
+            && unsafe { core::slice::from_raw_parts(int3 as *const u8, 9) } == bytes
+            && unsafe { *((start + ret) as *const u8) } == 0xc3
+        {
+            context.Rax = u64::from((context.Rax as u32).wrapping_add(1));
+            context.Rip = (start + ret) as u64;
+            let hits = record(&ASSERTS, int3 - start);
+            if hits.is_power_of_two() { log(format!("closed tile-run count at RVA {rva:#x} (hit {hits})")); }
+            return CONTINUE_EXECUTION;
+        }
+    }
     if !enabled() {
         if int3 + 9 > end {
             return CONTINUE_SEARCH;
