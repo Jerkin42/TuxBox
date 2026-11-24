@@ -26,7 +26,7 @@ pub fn shader(width: u32) -> (ShaderExtract, Vec<u32>, usize) {
     words.extend(&block);
     words.push(0xbf81_0000);
     let isa: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    let ex = ShaderExtract {
+    let ex = ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
         stage: Stage::Compute,
         shader_model: (6, 0),
         required_features: None,

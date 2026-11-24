@@ -22,7 +22,7 @@ fn fssm_rows(rows: &[[u32; 5]]) -> Vec<u8> {
 }
 
 fn heap_extract(isa: &[u8]) -> ShaderExtract {
-    ShaderExtract {
+    ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
         stage: Stage::Compute,
         shader_model: (6, 6),
         required_features: Some(1 << 25),

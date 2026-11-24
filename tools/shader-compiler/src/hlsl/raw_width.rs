@@ -25,6 +25,8 @@ fn compute_extract(words: &[u32]) -> ShaderExtract {
         isa,
         isa_offset_in_fssm: 0,
         psv_threads: None,
+        flat_inputs: Vec::new(),
+        flat_outputs: Vec::new(),
         isa_preamble: [0, 64, 1, 1],
         has_input_sig: false,
         has_output_sig: false,

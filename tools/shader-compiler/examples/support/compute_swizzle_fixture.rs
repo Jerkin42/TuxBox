@@ -6,7 +6,7 @@ use super::{ShaderExtract, Stage};
 pub fn shader(offset: u32, word0_extra: u32) -> ShaderExtract {
     let words = [0xd8d4_0000 | offset | word0_extra, 0x0000_0001, 0xbf8c_c07f, 0xbf81_0000];
     let isa: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    ShaderExtract {
+    ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
         stage: Stage::Compute,
         shader_model: (6, 0),
         required_features: None,

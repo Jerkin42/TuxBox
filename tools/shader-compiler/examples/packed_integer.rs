@@ -5,7 +5,7 @@ fn main() {
         .map(|s| u32::from_str_radix(&s, 16).expect("hex native word")).collect();
     assert!(!words.is_empty() && words.len() <= 256 && words.last() == Some(&0xbf810000));
     let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let ex = ShaderExtract {
+    let ex = ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
         stage: Stage::Compute, shader_model: (6, 0), required_features: None,
         bitcode_stripped: true, fspx_config: None, ps09_pixel_inputs: None,
         fssm: Vec::new(), entry: Some("main".into()), isa_data: isa.clone(),

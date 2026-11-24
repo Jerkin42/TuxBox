@@ -263,7 +263,7 @@ mod tests {
 
     fn extract(words: &[u32]) -> ShaderExtract {
         let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        ShaderExtract {
+        ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),
             stage: Stage::Compute, shader_model: (6, 0), required_features: None,
             bitcode_stripped: true, fspx_config: None, ps09_pixel_inputs: None,
             fssm: Vec::new(), entry: Some("main".into()), isa_data: isa.clone(),

@@ -99,11 +99,14 @@ fn descriptor(
         if border_word & 0x3fff_ffff != 0 || border_word >> 30 > 2 {
             return None;
         }
-        let (filter, aniso) = match (filters, address >> 9) {
+        // A signed 6.8 mip bias sits below the filters; point samplers may carry an
+        // anisotropy ratio the filters do not use.
+        let (filter, aniso) = match (filters & !0x3fff, address >> 9) {
             (0x14000000, 0) => (0, 1),
             (0x14500000, 0) => (0x14, 1),
             (0x18500000, 0) => (0x15, 1),
-            (0x18f00000, 2) => (0x55, 4),
+            (0x18500000, 1..=4) => (0x15, 1),
+            (0x18f00000, ratio @ 1..=4) => (0x55, 1 << ratio),
             _ => return None,
         };
         (filter, aniso, 1, border_word >> 30)
@@ -114,12 +117,14 @@ fn descriptor(
         6 => Some(4),
         _ => None,
     };
+    let bias = if compare { 0 } else { (((filters & 0x3fff) as i32) << 18 >> 18) as f32 as i32 };
+    let bias = if bias == 0 { 0 } else { (bias as f32 / 256.0).to_bits() };
     Some([
         filter,
         axis(0)?,
         axis(3)?,
         axis(6)?,
-        0,
+        bias,
         aniso,
         func,
         border,
@@ -149,22 +154,44 @@ pub struct InlineSamplers {
 /// compiler may fold several equal samplers to the same state, so a recovered
 /// root uses private slots keyed by the descriptor words and comparison mode.
 pub fn sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
+    classify(isa, visibility, false)
+}
+
+/// As [`sites`], leaving out samplers that are not literals the classifier knows.
+pub fn literal_sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
+    classify(isa, visibility, true)
+}
+
+/// The private samplers of a program whose own root signature is unknown.
+pub fn rootless(shader: &[u8], stage: u32) -> Option<Vec<[u32; 13]>> {
+    let d = Dxbc::parse(shader).ok()?;
+    let c = d.chunk(b"DXIL")?;
+    let dxil = shader.get(c.offset..c.offset + c.size)?;
+    let programs = xdat::programs(dxil.get(24..)?).ok()?;
+    let [program] = programs.as_slice() else { return None };
+    Some(literal_sites(&fssm::decode(program).ok()?.isa, if stage == 0 { 5 } else { 0 })?.descriptors)
+}
+
+fn classify(isa: &[u8], visibility: u32, partial: bool) -> Option<InlineSamplers> {
     use std::collections::{BTreeMap, BTreeSet};
     let ops = rdna2::disassemble(isa);
     if ops.len() > 32768 || !matches!(visibility, 0 | 5) {
         return None;
     }
+    let jump = |op: &rdna2::Insn| matches!(op.mnemonic.as_str(), "s_setpc_b64" | "s_swappc_b64");
     let mut successors = vec![[None; 2]; ops.len()];
     for (i, op) in ops.iter().enumerate() {
         let name = op.mnemonic.as_str();
         if name.starts_with("s_movrel")
             || name.starts_with("s_subvector_loop")
-            || matches!(
-                name,
-                "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap"
-            )
+            || matches!(name, "s_call_b64" | "s_rfe_b64" | "s_trap")
         {
             return None;
+        }
+        // The target is unknown. Nothing flows on to the next instruction, and an
+        // instruction that only such a jump can reach starts with unknown registers.
+        if jump(op) {
+            continue;
         }
         if name.contains("branch") {
             if op.enc != Enc::Sopp || !matches!(op.op, 2 | 4..=9) {
@@ -187,6 +214,19 @@ pub fn sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
     let mut incoming = vec![Vec::new(); ops.len()];
     let mut reachable = vec![false; ops.len()];
     let mut work = vec![0];
+    let mut entries = BTreeSet::new();
+    if ops.iter().any(jump) {
+        // Jump targets are code that follows an unconditional transfer.
+        let mut open = false;
+        for (i, op) in ops.iter().enumerate() {
+            if open && op.mnemonic != "s_nop" {
+                entries.insert(i);
+                open = false;
+            }
+            open |= jump(op) || matches!(op.mnemonic.as_str(), "s_branch" | "s_endpgm");
+        }
+        work.extend(&entries);
+    }
     while let Some(pc) = work.pop() {
         if std::mem::replace(reachable.get_mut(pc)?, true) {
             continue;
@@ -196,10 +236,14 @@ pub fn sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
             work.push(target);
         }
     }
+    // A wave64 mask occupies an even-aligned pair, so an odd VOP3 comparison
+    // destination proves one-word masks throughout the program.
+    let one_word = ops.iter().any(|op| op.enc == Enc::Vop3 && op.mnemonic.starts_with("v_cmp_")
+        && matches!(op.dst[..], [Opnd::Sgpr(n)] if n & 1 != 0));
     // Accept a literal only if every reaching definition supplies exactly
     // that value, including loop backedges and moves between SGPRs.
     let reaching = |pc: usize, reg: u8| -> Option<u32> {
-        if pc == 0 {
+        if pc == 0 || entries.contains(&pc) {
             return None; // No reaching definition at program entry.
         }
         let mut literal = None;
@@ -210,7 +254,9 @@ pub fn sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
                 continue;
             }
             let op = &ops[i];
-            if rdna2::clobbers_scalar(op, r) {
+            // One-word compare masks leave the next register alone.
+            let mask = one_word && op.enc == Enc::Vop3 && op.mnemonic.starts_with("v_cmp") && op.dst != [Opnd::Sgpr(r)];
+            if rdna2::clobbers_scalar(op, r) && !mask {
                 let value = if op.mnemonic == "s_mov_b64" && op.enc == Enc::Sop1 {
                     // Resolve the requested half of an ordinary SGPR pair
                     // copy using pre-instruction definitions, including overlap.
@@ -247,7 +293,7 @@ pub fn sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
                     continue;
                 }
             }
-            if i == 0 || incoming[i].is_empty() {
+            if i == 0 || incoming[i].is_empty() || entries.contains(&i) {
                 return None;
             }
             pending.extend(incoming[i].iter().map(|&pred| (pred, r)));
@@ -265,10 +311,18 @@ pub fn sites(isa: &[u8], visibility: u32) -> Option<InlineSamplers> {
             return None;
         };
         let mut words = [0; 4];
-        for (n, word) in words.iter_mut().enumerate() {
-            *word = reaching(i, base.checked_add(n as u8)?)?;
+        let literal = words.iter_mut().enumerate().all(|(n, word)| {
+            let value = base.checked_add(n as u8).and_then(|reg| reaching(i, reg));
+            if let Some(v) = value { *word = v; }
+            value.is_some()
+        });
+        // A sampler loaded from a descriptor keeps the binding it came from.
+        let compare = comparison(op.op);
+        if !literal || descriptor(words, 0, 32765, visibility, compare).is_none() {
+            if !partial { return None; }
+            continue;
         }
-        states.insert(op.offset, (words, comparison(op.op)));
+        states.insert(op.offset, (words, compare));
     }
     let unique: BTreeSet<_> = states.values().copied().collect();
     if unique.is_empty() || unique.len() > 128 {

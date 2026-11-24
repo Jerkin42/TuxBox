@@ -260,7 +260,7 @@ pub fn corroborated_descriptor(
 }
 
 /// The same descriptor as [`corroborated_descriptor`], when `root` leaves its
-/// table slot empty and does not already declare that register.
+/// table slot empty.
 pub fn uncovered_descriptor(
     program: &[u8],
     resources: &[[u32; 4]],
@@ -277,12 +277,19 @@ pub fn uncovered_descriptor(
         root.params.get(table as usize).map(|param| &param.kind),
         Some(crate::rootsig::RootParamKind::Table(_))
     ) || table_covers_slot(root, table, slot)
-        || root_declares(root, kind, register, space)
     {
         return None;
     }
+    // An embedded root numbers its ranges independently of the shader. A number it gave to
+    // another slot is replaced with one of our own.
+    if root_declares(root, kind, register, space) {
+        return Some((kind, slot, UNCOVERED_SPACE + table));
+    }
     Some((kind, register, space))
 }
+
+/// Spaces of slots whose own register an embedded root already uses, one per table.
+const UNCOVERED_SPACE: u32 = 32_700;
 
 /// FSSM descriptor slots missing from an embedded root. Each returned binding
 /// is one range to append: the slot is uncovered and the register is free.
@@ -783,7 +790,7 @@ mod tests {
         let taken = root(vec![RootRange {
             range_type: 2, num: 1, base_register: 28, space: 1, offset_in_table: 16,
         }]);
-        assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 0x320, &taken), None);
+        assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 0x320, &taken), Some((2, 25, 32_701)));
     }
 
     #[test]

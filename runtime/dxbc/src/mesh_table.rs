@@ -65,6 +65,15 @@ impl MeshLayout {
         let mut sgprs = BTreeMap::new();
         let mut parameter_sgprs = BTreeMap::new();
         for [class, offset, register, shape, location] in used {
+            if class == 0x401 {
+                // A static sampler: the console inlines its state in the code.
+                let mut named = resources.iter().filter(|r| (r[0], r[2], r[3]) == (1, register, register));
+                let space = named.next()?[1];
+                if named.next().is_some() || !used_resources.insert((1, space, register)) {
+                    return None;
+                }
+                continue;
+            }
             let index = (location >> 16) as usize;
             let root_param = root.params.get(index)?;
             let sgpr = ((location >> 8) as u8).checked_add(8)?;
@@ -76,8 +85,13 @@ impl MeshLayout {
             {
                 return None;
             }
+            let named = |ty| resources.iter().filter(|r| (r[0], r[2], r[3]) == (ty, register, register)).count();
             let (ty, width) = match (class, location & 255, shape) {
                 (0x300, 4, 1) => (4, 1),
+                // Four elements: a typed buffer, or a structured one with one-word elements.
+                (0x300, 4, 4) if named(3) == 1 && named(5) == 0 => (3, 1),
+                // An eight-word descriptor is a texture.
+                (0x300, 8, _) => (3, 1),
                 (0x300, 4, n) if (4..=2048).contains(&n) && n % 4 == 0 => (5, 1),
                 (0x302, 4, 0) => (2, 1),
                 (0x100, 4, 1) => (4, 2),
