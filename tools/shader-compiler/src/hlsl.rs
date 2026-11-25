@@ -4347,6 +4347,13 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             // skipped, and in-body flags are cleared at the bottom of each iteration.
         }
         let labels: BTreeSet<usize> = target.values().copied().collect();
+        // The earliest jump to each label, so that the labels pending at an instruction do
+        // not take a pass over every jump.
+        let mut first_jump: HashMap<usize, usize> = HashMap::new();
+        for (&b, &t) in &target {
+            let first = first_jump.entry(t).or_insert(b);
+            *first = (*first).min(b);
+        }
         for l in &labels {
             self.line(&format!("bool j{l} = false;"));
         }
@@ -4410,7 +4417,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.line(&format!("tb_c{b} = false;"));
             }
             let mut active: Vec<usize> =
-                labels.iter().copied().filter(|&t| t > i && target.iter().any(|(&b, &bt)| bt == t && b < i)).collect();
+                labels.range(i + 1..).copied().filter(|t| first_jump[t] < i).collect();
             if self.page_waves || self.hoist_wave_exchanges {
                 let exchange = if self.page_waves {
                     page_waves::rendezvous(i, ins)?
