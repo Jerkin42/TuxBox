@@ -121,6 +121,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuxbox-xcrdapi-codec"
+version = "0.1.0"
+
+[[package]]
 name = "tuxbox-xg"
 version = "0.1.0"
 dependencies = [

@@ -100,6 +100,7 @@ python -m unittest discover -s tests -q
 cargo test --locked --target x86_64-unknown-linux-gnu --manifest-path tools/shader-compiler/Cargo.toml
 cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-dxbc --features native-bindings
 cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-xg-layout
+cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-xcrdapi-codec
 cargo check --locked --target x86_64-pc-windows-msvc -p tuxbox-d3d12
 ```
 
