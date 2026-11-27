@@ -94,6 +94,7 @@ All are off by default. Capture variables write the game's data to disk, so don'
 | `TUXBOX_TRACE_ALLOCATION_BYTES` | Allocations of the listed sizes |
 | `TUXBOX_WATCH_ADDRESS` | Allocations and resources near `<hex>[,<hex radius>]` |
 | `TUXBOX_XG_TRACE` | XG address calculations |
+| `TUXBOX_XCRD_LOG` | DirectStorage requests counted by option word (zlib, BCPack mode, swizzle, page and memory flags) with their sizes, every five seconds and when a queue closes. Requests with options the provider can't handle are logged once per option word without it |
 | `TUXBOX_WAVE_DEBUG` | Why the translator didn't mask a wave reduction |
 | `TUXBOX_CAPTURE_SHADER_INPUTS`, `TUXBOX_CAPTURE_RASTER_ROOTS`, `TUXBOX_CAPTURE_RAY_ROOTS` | Folder for shader inputs and root data |
 | `TUXBOX_CAPTURE_BLAS` | Folder for acceleration structure inputs |

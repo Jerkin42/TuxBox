@@ -187,6 +187,19 @@ static void run(int argc, wchar_t **argv) {
   require(
       std::all_of(out.begin(), out.end(), [](unsigned v) { return v == 0xa5; }),
       "cancelled write");
+  // BCPack (bits 1-4) is not decoded yet: the request fails and leaves its
+  // destination unwritten instead of copying packed bytes into a texture.
+  r.options = UINT64(7) << 1;
+  q->EnqueueRequest(&r);
+  q->EnqueueStatus(status.Get(), 0);
+  q->Submit();
+  require(wait_status(status.Get(), 0) == E_NOTIMPL &&
+              std::all_of(out.begin(), out.end(),
+                          [](unsigned v) { return v == 0xa5; }),
+          "BCPack refused");
+  alignas(8) std::array<BYTE, 1024> record{};
+  q->RetrieveErrorRecord(record.data());
+  r.options = 0;
   HANDLE event = q->GetErrorEvent();
   require(event != nullptr, "error event");
   r.offset = 65536;
@@ -207,7 +220,6 @@ static void run(int argc, wchar_t **argv) {
           "EOF and corrupt zlib");
   require(WaitForSingleObject(event, 1000) == WAIT_OBJECT_0,
           "signalled error event");
-  alignas(8) std::array<BYTE, 1024> record{};
   q->RetrieveErrorRecord(record.data());
   require(*reinterpret_cast<const UINT32 *>(record.data()) == 2,
           "two recorded errors");

@@ -1,4 +1,5 @@
 use super::*;
+use crate::diag;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
@@ -344,6 +345,9 @@ fn execute_reads(shared: &Shared, batch: &[Entry]) -> Vec<Result<(), HRESULT>> {
 
 fn finish(shared: &Shared, entry: &Entry, result: Result<(), HRESULT>, last_error: &mut HRESULT) {
     if let Err(hr) = result {
+        if let Entry::Read(read) = entry {
+            diag::failed(read.options);
+        }
         if last_error.is_ok() {
             *last_error = hr;
         }
@@ -472,6 +476,7 @@ impl Queue {
         }
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
+            diag::flush();
         }
     }
 }
@@ -485,10 +490,12 @@ impl Drop for Queue {
 
 impl IQueue_Impl for Queue_Impl {
     unsafe fn EnqueueRequest(&self, req: *const Request) {
-        self.enqueue(
-            unsafe { capture(self.source_type, req) }
-                .map_or_else(|e| Entry::Invalid(e, 0), Entry::Read),
-        );
+        let captured = unsafe { capture(self.source_type, req) };
+        if let Some(r) = unsafe { req.as_ref() } {
+            let refused = captured.as_ref().err().copied();
+            diag::request(r.options, r.size, r.destination_size, r.intermediate_size, refused);
+        }
+        self.enqueue(captured.map_or_else(|e| Entry::Invalid(e, 0), Entry::Read));
     }
     unsafe fn EnqueueStatus(&self, array: *mut c_void, index: u32) {
         let entry = unsafe { IUnknown::from_raw_borrowed(&array) }
@@ -609,7 +616,7 @@ impl IQueue2_Impl for Queue_Impl {
 }
 
 
-fn debug(text: &str) {
+pub(crate) fn debug(text: &str) {
     let line = std::ffi::CString::new(format!("{text}\n")).unwrap_or_default();
     unsafe { windows::Win32::System::Diagnostics::Debug::OutputDebugStringA(windows::core::PCSTR(line.as_ptr().cast())) };
 }
