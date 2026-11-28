@@ -37,7 +37,7 @@ NVIDIA_CACHE_BYTES = 4 << 30
 # A launch starts a new cache file once the current one holds this much, which
 # leaves one launch 3 GiB before the file's 32-bit index is full.
 NVIDIA_CACHE_ROTATE_BYTES = 1 << 30
-NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)0")
+NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)[0-9]")
 
 
 def requires_offline(executable):
@@ -348,12 +348,17 @@ def rotate_nvidia_shader_cache(env, cache):
                 sizes[blob.stem] = max(size, sizes.get(blob.stem, 0))
     except OSError:
         return None
-    # The driver appends a 0 to the name it is given.
-    numbers = [int(match[1]) for match in map(NVIDIA_CACHE_FILE.fullmatch, sizes) if match]
-    number = max(numbers, default=1)
-    if sizes.get(f"tuxbox{number}0", 0) >= NVIDIA_CACHE_ROTATE_BYTES:
+    # The driver appends one digit to the name it is given, and can keep
+    # several such files: a ProjectScarlett launch filled the one ending in 2.
+    largest = {}
+    for name, size in sizes.items():
+        if match := NVIDIA_CACHE_FILE.fullmatch(name):
+            largest[int(match[1])] = max(size, largest.get(int(match[1]), 0))
+    number = max(largest, default=1)
+    if largest.get(number, 0) >= NVIDIA_CACHE_ROTATE_BYTES:
         number += 1
-    older = sorted(name for name in sizes if name != f"tuxbox{number}0")
+    older = sorted(name for name in sizes
+                   if not ((match := NVIDIA_CACHE_FILE.fullmatch(name)) and int(match[1]) == number))
     env["__GL_SHADER_DISK_CACHE_APP_NAME"] = f"tuxbox{number}"
     if older:
         env["__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"] = ";".join(older)
