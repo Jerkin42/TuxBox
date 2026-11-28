@@ -366,10 +366,13 @@ fn a_restore_nothing_runs_under_does_not_refuse_the_program() {
         0x7e140214];
     let hlsl = translated(&behind_a_mask_branch(&body)).unwrap();
     assert!(hlsl.contains("!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)"), "{hlsl}");
-    // With a vector write under the stale EXEC the lanes go their own ways as before.
+    // With a vector write under the stale EXEC lockstep can't prove the program, and the
+    // whole wave still takes the branch.
     let mut under = body.to_vec();
     under.insert(6, 0x7e140285); // v_mov_b32 v10, 5
-    assert!(!translated(&behind_a_mask_branch(&under)).is_ok_and(|hlsl| hlsl.contains("WaveActiveAnyTrue((vcc_lo")));
+    let hlsl = translated(&behind_a_mask_branch(&under)).unwrap();
+    assert!(!hlsl.contains("scc = uint(WaveActiveAnyTrue"), "{hlsl}");
+    assert!(hlsl.contains("!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)"), "{hlsl}");
 }
 
 #[test]
@@ -391,11 +394,12 @@ fn a_guarded_reduction_behind_interleaved_loops_branches_with_the_wave() {
     assert!(hlsl.contains("tb_pc"), "{hlsl}");
     assert!(hlsl.contains("(!WaveActiveAnyTrue((exec_lo & 1u) != 0u)) ? "), "{hlsl}");
     assert!(hlsl.contains("(!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)) ? "), "{hlsl}");
-    // Without the loops the guard's own vote is kept, and the other branches stay each lane's.
+    // Without the loops every branch on a mask is still the whole wave's.
     let straight = [&[0xbe8c037eu32, 0x7d8200ff, 0x000003e8, 0xbf860001, 0x80158115, 0xbf880011][..], &REDUCTION[..],
         &[0xbf810000]].concat();
     let hlsl = translated(&straight).unwrap();
-    assert!(hlsl.contains("(vcc_lo & 1u) == 0u"), "{hlsl}");
+    assert!(hlsl.contains("!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)"), "{hlsl}");
+    assert!(!hlsl.contains("(vcc_lo & 1u) == 0u"), "{hlsl}");
     assert!(hlsl.contains("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)"), "{hlsl}");
 }
 

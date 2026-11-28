@@ -568,7 +568,8 @@ impl<'a> Emitter<'a> {
                 tgt.get(&(end - 1)),
             ) {
                 if self.wave_cull { wave_cull::prepare_insn(self, end - 1, last)?; }
-                let c = wave_cull::branch_condition(self, last, c);
+                let whole_wave = mask_ballots::branch(self, end - 1, last.op);
+                let c = wave_cull::branch_condition(self, last, whole_wave.as_deref().unwrap_or(c));
                 if last.op == 2 { format!("{t}u") } else { format!("({c}) ? {t}u : {end}u") }
             } else {
                 format!("{end}u")

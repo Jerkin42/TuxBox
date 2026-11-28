@@ -275,8 +275,8 @@ fn main() {
         }
         "wave64_swizzle_branch_dyn_63" => {
             // Wave64 [64, 1, 1] ds_swizzle_b32 + dynamic SGPR v_readlane_b32 inside a forward
-            // s_cbranch_execz skip branch where lane 63 skips the readlane.
-            // Active lanes 0..62 MUST receive lane 63's original pre-mask v1 (not 0).
+            // s_cbranch_execz skip branch that lane 63 is not active for.
+            // Every lane MUST receive lane 63's original pre-mask v1 (not 0) in s7.
             let [r0, r1] = readlane_sgpr(7, 1, 5);
             (
                 [64, 1, 1],
@@ -374,6 +374,9 @@ fn main() {
     if check_wave {
         if expect_wave32 {
             assert_eq!(tr.required_wave_size, Some(32), "{case} must use WaveSize(32)");
+        } else if case == "wave64_swizzle_branch_dyn_63" {
+            // Its EXECZ branch is decided by the whole wave, which needs the guest's width.
+            assert_eq!(tr.required_wave_size, Some(64), "{case} must use WaveSize(64)");
         } else {
             assert_eq!(tr.required_wave_size, None, "{case} must be portable (no WaveSize)");
         }

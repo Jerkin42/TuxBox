@@ -30,7 +30,9 @@ impl<'a> Emitter<'a> {
                     self.ws(&link, &format!("{:#x}u", ins.offset + 4))?;
                     self.ws(&hi(&link), "0u")?;
                 }
+                let whole_wave = mask_ballots::branch(self, idx, ins.op);
                 let cond = match ins.op {
+                    _ if whole_wave.is_some() => whole_wave,
                     2 => Some("true".to_string()),
                     4 => Some("scc == 0u".into()),
                     5 => Some("scc != 0u".into()),

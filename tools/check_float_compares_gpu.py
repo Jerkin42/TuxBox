@@ -246,12 +246,7 @@ def words_of(items_, llvm_mc, width):
 # Known faults of the translation, which the check expects until they are fixed.
 # A form names the translation: "32", "64" or "64-paired". Each fault is also
 # modelled, so the check fails when one disappears without this table changing.
-KNOWN = {
-    # The skip behind `s_cbranch_execz` after a v_cmpx is decided per lane, so
-    # a scalar written in the block reaches only the lanes left in EXEC. The
-    # paired translation decides it for the whole wave.
-    "execz": dict(forms=("32", "64"), cause="a branch on an empty EXEC after v_cmpx is decided per lane"),
-}
+KNOWN = {}
 
 
 def known_for(form):

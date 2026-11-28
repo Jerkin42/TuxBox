@@ -614,7 +614,8 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
-    if em.portable_wave64 { em.mask_ballots = None; }
+    // Lockstep counts, reads and branches on masks across the wave itself.
+    if em.portable_wave64 || em.lockstep.is_some() { em.mask_ballots = None; }
     em.regs.extend(em.mask_ballots.iter().flat_map(mask_ballots::Ballots::names).collect::<Vec<_>>());
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
