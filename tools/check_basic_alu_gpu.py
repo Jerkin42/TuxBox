@@ -293,6 +293,11 @@ def borrow(minuend, subtrahend, carry):
 CARRY = "v_cmp_lt_u32_e32 vcc_lo, v4, v6"
 CARRY_OUT = "v_cndmask_b32_e64 {1}, 0, 1, vcc_lo"
 SEQUENCES = {
+    # A long jump: s_getpc_b64 gives the next instruction's address, and the jump
+    # lands 16 bytes after it, past a move that would replace the result.
+    "s_setpc_b64": (["v_mov_b32_e32 {0}, v5", "s_getpc_b64 s[20:21]", "s_add_u32 s20, s20, 16",
+                     "s_addc_u32 s21, s21, 0", "s_setpc_b64 s[20:21]", "v_mov_b32_e32 {0}, v4", "s_nop 0"],
+                    lambda a, b, c: [b]),
     # The count is the first source; the value is the pair in the next two.
     "v_lshlrev_b64": (["v_lshlrev_b64 v[{0n}:{1n}], v4, v[5:6]"],
                       lambda a, b, c: list(halves64((b | c << 32) << (a & 63)))),

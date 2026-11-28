@@ -60,6 +60,16 @@ const TABLE: [u32; 8] = [0x7ab1_0000, 0x7ab1_0011, 0x7ab1_0022, 0x7ab1_0033, 0x7
 /// address of the second instruction, as the vector address of a flat load.
 const OWN_ADDRESS: [u32; 3] = [0xbe80_1f00, 0x7e08_0200, 0x7e0a_0201];
 
+/// `s_getpc_b64 s[2:3]`, `s_add_u32 s2, s2, 48` and `s_addc_u32 s3, s3, 0`: the table after
+/// the 13-word halfword programs, as the title's own halfword lookups address it. Then the
+/// element index in s10 follows.
+const HALFWORD_BASE: [u32; 3] = [0xbe82_1f00, 0x8002_b002, 0x8203_8003];
+/// `s_mov_b32 s11, 0`, `s_lshl_b64 s[12:13], s[10:11], 1`, `s_add_u32 s14, s12, s2`,
+/// `s_addc_u32 s15, s13, s3`, `v_mov_b32 v4, s14`, `v_mov_b32 v5, s15` and
+/// `flat_load_ushort v7, v[4:5]`.
+const HALFWORD_LOAD: [u32; 8] = [0xbe8b_0380, 0x8f8c_810a, 0x800e_020c, 0x820f_030d, 0x7e08_020e, 0x7e0a_020f,
+    0xdc28_0000, 0x077d_0004];
+
 /// An FSSM with user-data and used-resource rows.
 fn records(user: &[[u32; 5]], used: &[[u32; 5]]) -> Vec<u8> {
     let mut program = vec![0u8; 0x110];
@@ -170,6 +180,9 @@ const CASES: &[Case] = &[
      words!(OWN_ADDRESS, [0xdc3c_0018, 0x077d_0004])),
     ("code-x4", "code", 0, Some(CODE_TABLE), "v7 v8 v9 v10", "0x7ab10011 0x7ab10022 0x7ab10033 0x7ab10044",
      words!(OWN_ADDRESS, [0xdc38_0018, 0x077d_0004])),
+    // flat_load_ushort v7, v[4:5] of halfword 2 and 3 of the table: each half of its second word.
+    ("code-ushort-low", "code", 0, Some(CODE_TABLE), "v7", "0x11", words!(HALFWORD_BASE, [0xbe8a_0382], HALFWORD_LOAD)),
+    ("code-ushort-high", "code", 0, Some(CODE_TABLE), "v7", "0x7ab1", words!(HALFWORD_BASE, [0xbe8a_0383], HALFWORD_LOAD)),
     // buffer_store_dword* v5.., v4, s[8:11], 0 offen, then the four words read back
     ("store-x1", "raw-write", 1, Some(7), "v9 v10 v11 v12", "0x11223344 p5 p6 p7",
      words!([SIXTEEN], DATA, [0xe070_1000, 0x8002_0504], BACK4)),
@@ -248,3 +261,14 @@ fn a_load_to_group_memory_is_refused() {
     assert!(error.contains("FLAT LDS"), "{error}");
 }
 
+
+#[test]
+fn halfword_lookup_encodings() {
+    let words = [&HALFWORD_BASE[..], &[0xbe8a_0382], &HALFWORD_LOAD[..], &[END]].concat();
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let names: Vec<String> = crate::rdna2::disassemble(&bytes).into_iter().map(|i| i.mnemonic).collect();
+    assert_eq!(names, ["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_mov_b32", "s_mov_b32", "s_lshl_b64", "s_add_u32",
+        "s_addc_u32", "v_mov_b32", "v_mov_b32", "flat_load_ushort", "s_endpgm"]);
+    // The table starts where the code ends.
+    assert_eq!(bytes.len(), 4 + 48);
+}
