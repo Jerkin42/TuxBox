@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
+from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, limit_malloc_growth, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
 
 
 class ScarlettWindowsDxc(unittest.TestCase):
@@ -463,6 +463,15 @@ class PipelineCache(unittest.TestCase):
             env = {"VKD3D_SHADER_CACHE_PATH": value}
             configure_pipeline_cache(env, Path("/unused"))
             self.assertEqual(env, {"VKD3D_SHADER_CACHE_PATH": value})
+
+
+class MallocLimits(unittest.TestCase):
+    def test_limits_are_added_and_a_user_value_is_kept(self):
+        env = {"MALLOC_ARENA_MAX": "2"}
+        limit_malloc_growth(env)
+        self.assertEqual(env["MALLOC_ARENA_MAX"], "2")
+        self.assertEqual(env["MALLOC_MMAP_THRESHOLD_"], "1048576")
+        self.assertEqual(env["MALLOC_TRIM_THRESHOLD_"], "8388608")
 
 
 class NvidiaShaderCache(unittest.TestCase):

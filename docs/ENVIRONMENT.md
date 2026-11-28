@@ -29,6 +29,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | Variable | Value | Purpose |
 | --- | --- | --- |
 | `VKD3D_SHADER_CACHE_PATH` | `<prefix>/shadercache` | vkd3d-proton's pipeline cache; `0` disables it. The launcher merges the last launch's `.write` archive into it, which GE-Proton11-14 otherwise discards |
+| `MALLOC_ARENA_MAX`, `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_` | `8`, `1048576`, `8388608` | glibc limits for Proton and Wine launches, so freed compile memory is shared and returned instead of piling up in per-thread arenas |
 | `__GL_SHADER_DISK_CACHE` | `1` | NVIDIA driver cache; `0` leaves it off |
 | `__GL_SHADER_DISK_CACHE_PATH` | `<prefix>/shadercache` | Gives each prefix its own NVIDIA cache |
 | `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP` | `1` | Asks the NVIDIA driver not to trim the cache |

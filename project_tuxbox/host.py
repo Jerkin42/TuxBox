@@ -377,6 +377,23 @@ def keep_nvidia_shader_cache(env):
         env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
 
 
+# glibc gives each busy thread its own arena, up to 8 per CPU, and a title
+# compiling pipelines on dozens of threads leaves free memory spread across all
+# of them. A ProjectScarlett launch with the defaults held 22.75 GiB in 371
+# arena heaps by 200 s; one with these reached its loading screen.
+GLIBC_MALLOC_LIMITS = {
+    "MALLOC_ARENA_MAX": "8",
+    "MALLOC_MMAP_THRESHOLD_": str(1 << 20),
+    "MALLOC_TRIM_THRESHOLD_": str(8 << 20),
+}
+
+
+def limit_malloc_growth(env):
+    """Bound what the C library keeps beyond what the title and driver use."""
+    for name, value in GLIBC_MALLOC_LIMITS.items():
+        env.setdefault(name, value)
+
+
 def configure_nvidia_shader_cache(env, report=None):
     """Keep this prefix's compiled GPU pipelines for the next launch.
 
@@ -570,6 +587,7 @@ class Host:
                     log.status(f"The package is not mapped to G: because {drive} is not a drive link")
         try:
             if self.backend in ("proton", "wine"):
+                limit_malloc_growth(env)
                 configure_nvidia_shader_cache(env, log.status)
                 merge_pipeline_cache(env, executable, log.status)
             if "-nullrhi" not in (arg.lower() for arg in arguments):
