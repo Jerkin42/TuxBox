@@ -48,6 +48,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `indirect-dispatch` | `ExecuteIndirect` on its Series X\|S slot matches a direct dispatch |
 | `gpu-indirect-dispatch` | A compute shader writes indirect dispatch arguments for 0, 1 and 2 groups. Check all 24 output words, including untouched guards. |
 | `gpu-indirect-order` | A compute shader rewrites dispatch arguments, and a command count, 48 times in one list, with no CPU wait before each `ExecuteIndirect` that reads them. Six cases: a transition to the indirect argument state, a transition to a combined read state, or only a UAV barrier between the write and the read, each with and without a count buffer. Every round must read the values just written. |
+| `mesh-signature` | A mesh dispatch signature is made when the device reports mesh shaders, and refused with `E_NOTIMPL` when it doesn't |
 | `dispatch-wait` | Copies a producer's word after a label wait, first at list start and then immediately after a course dispatch. Reports whether compute finished before producer submission and the word read by the CPU. |
 | `texture-readback` | `CopyMemoryToMemoryX` reads a guest texture into title memory |
 | `texture-publication` | The GPU writes a tiled guest texture several times while a compute queue waits for the last write's label. Title memory then holds each texel in its console position. The padding between texels, a page the title closed and write-watched memory past the texture are untouched. |

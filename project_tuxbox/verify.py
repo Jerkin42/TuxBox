@@ -32,7 +32,7 @@ OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.d
 SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
-                   "indirect-dispatch", "gpu-indirect-dispatch", "gpu-indirect-order",
+                   "indirect-dispatch", "gpu-indirect-dispatch", "gpu-indirect-order", "mesh-signature",
                    "dispatch-wait", "direct-copy-wait", "texture-readback", "texture-publication",
                    "ray-tracing-builder", "thread-dimensions",
                    "descriptor-reclaim", "unwritten-descriptors")
@@ -1206,6 +1206,21 @@ def verify(host, output, adapter, selected=None, samples=1):
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                       config="lanes/MicrosoftGame.config", device_factory="xbox",
                       dependencies=("lanes/XboxBvhBuilder.dll",) if scenario == "ray-tracing-builder" else ())
+            # A card with mesh shaders also takes the refusal a card without them gets.
+            saved_profile = host.env.get("TUXBOX_HOST_PROFILE")
+            host.env["TUXBOX_HOST_PROFILE"] = "mesh=none"
+            check("lanes-selftest-mesh-signature-none", "lanes/lanes.exe",
+                  ["--selftest", "mesh-signature", *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario=mesh-signature passed=1",
+                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                  config="lanes/MicrosoftGame.config", device_factory="xbox",
+                  log_check=lambda output: None if "mesh-signature tier=0 result=0x80004001" in output
+                  else "the device still reported mesh shaders, or the signature was not refused")
+            if saved_profile is None:
+                host.env.pop("TUXBOX_HOST_PROFILE", None)
+            else:
+                host.env["TUXBOX_HOST_PROFILE"] = saved_profile
             if saved_limit is None:
                 host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
             else:
@@ -1348,6 +1363,8 @@ GATE_LABELS = {
     "lanes-selftest-direct-copy-wait": "A direct queue waiting before and after a buffer copy",
     "lanes-selftest-gpu-indirect-dispatch": "GPU-written arguments controlling an indirect dispatch",
     "lanes-selftest-gpu-indirect-order": "Indirect arguments and counts read after the dispatch that wrote them",
+    "lanes-selftest-mesh-signature": "A mesh dispatch signature made only when the device reports mesh shaders",
+    "lanes-selftest-mesh-signature-none": "A mesh dispatch signature refused when the host profile takes mesh shaders away",
     "lanes-selftest-dispatch-wait": "A memory wait before and after a compute dispatch",
     "lanes-selftest-texture-readback": "A guest texture copied back to title memory",
     "lanes-selftest-texture-publication": "GPU texture writes published to title memory, leaving padding, closed pages and memory past the texture alone",

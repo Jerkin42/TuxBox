@@ -1587,6 +1587,26 @@ void indirect_dispatch(ID3D12Device* device) {
     if (rows[0] != rows[1]) throw std::runtime_error("indirect dispatch differs from the direct dispatch");
 }
 
+// A mesh dispatch signature is made exactly when the device reports mesh
+// shaders. Without them it must be refused: some drivers fault while
+// creating one instead of returning an error.
+void mesh_signature(ID3D12Device* device) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
+    check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "mesh options");
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
+    ComPtr<ID3D12CommandSignature> command;
+    const HRESULT hr = device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&command));
+    const bool mesh = options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+    std::fprintf(stderr, "mesh-signature tier=%d result=0x%08lx\n", static_cast<int>(options.MeshShaderTier),
+                 static_cast<unsigned long>(hr));
+    if (mesh && (FAILED(hr) || !command))
+        throw std::runtime_error("mesh dispatch signature refused on a device with mesh shaders");
+    if (!mesh && (hr != E_NOTIMPL || command))
+        throw std::runtime_error("mesh dispatch signature not refused on a device without mesh shaders");
+}
+
 // The producer and ExecuteIndirect share a compute list. Only the final
 // readback waits on a CPU fence.
 void gpu_indirect_dispatch(ID3D12Device* device) {
@@ -3340,6 +3360,7 @@ constexpr Scenario scenarios[] = {
     {L"indirect-dispatch", indirect_dispatch},
     {L"gpu-indirect-dispatch", gpu_indirect_dispatch},
     {L"gpu-indirect-order", gpu_indirect_order},
+    {L"mesh-signature", mesh_signature},
     {L"dispatch-wait", dispatch_wait},
     {L"texture-readback", texture_readback},
     {L"texture-publication", texture_publication},
@@ -3417,6 +3438,7 @@ std::string narrow(const wchar_t* text) {
 const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
                                              L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
                                              L"indirect-dispatch", L"gpu-indirect-dispatch", L"gpu-indirect-order",
+                                             L"mesh-signature",
                                              L"dispatch-wait", L"texture-readback", L"texture-publication",
                                              L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim", L"unwritten-descriptors",
