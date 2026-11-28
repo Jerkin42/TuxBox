@@ -10,7 +10,7 @@ import subprocess
 import sys
 from contextlib import nullcontext
 
-from .backend_log import game_diagnostics
+from .backend_log import PROTON_APP_ID, game_diagnostics
 from .console_cbv import configure_console_cbv
 from .mangohud import performance_capture
 from .pipeline_profile import pipeline_capture
@@ -457,7 +457,7 @@ class Host:
             if not (installation / "proton").is_file():
                 raise ValueError(f"Missing Proton distribution launcher in {installation}")
             tool = "umu-run"
-            self.env.update(PROTONPATH=str(installation), GAMEID="umu-default")
+            self.env.update(PROTONPATH=str(installation), GAMEID=f"umu-{PROTON_APP_ID}")
             version = installation / "version"
             self.version = version.read_text().strip() if version.is_file() else installation.name
             prefix_name = installation.name
