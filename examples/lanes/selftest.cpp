@@ -595,6 +595,92 @@ void large_dispatch(ID3D12Device* device) {
     }
 }
 
+// A console program whose driver compile misses a short pipeline deadline. The
+// title gets a stand-in, which writes nothing; once the compile finishes, the
+// next bind runs the real pipeline. Each thread stores the end of its chain.
+void late_pipeline(ID3D12Device* device) {
+    constexpr UINT words = 64;
+    constexpr UINT64 bytes = words * sizeof(UINT);
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER table{};
+    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    table.DescriptorTable = {1, &range};
+    D3D12_ROOT_SIGNATURE_DESC signature{1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize late pipeline root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create late pipeline root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {late_shader, sizeof(late_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline from the late program");
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create late pipeline view heap");
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu{method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get())};
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{method<GpuHandle>(heap.Get(), 10)(heap.Get())};
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    const std::vector<UINT> unwritten(words, 0xdeadbeefu);
+    compute_fixture::upload(seed.Get(), unwritten.data(), size_t(bytes));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.Buffer.NumElements = words;
+    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &view, cpu);
+
+    // A stand-in leaves every word unwritten. Anything else must be the real result.
+    for (int attempt = 0; attempt < 600; ++attempt) {
+        Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        ID3D12GraphicsCommandList* list = direct.list.Get();
+        list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+        compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap* heaps[]{heap.Get()};
+        method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+        method<SetRoot>(list, slot_compute_root)(list, root.Get());
+        list->SetPipelineState(pipeline.Get());
+        method<SetTable>(list, slot_compute_table)(list, 0, gpu);
+        list->Dispatch(1, 1, 1);
+        compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+        direct.submit();
+        direct.finish("late pipeline dispatch");
+
+        D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+        void* mapped = nullptr;
+        check(readback->Map(0, &read, &mapped), "map late pipeline readback");
+        std::vector<UINT> got(words);
+        std::memcpy(got.data(), mapped, size_t(bytes));
+        readback->Unmap(0, &empty);
+        if (got == unwritten) {
+            Sleep(200);
+            continue;
+        }
+        for (UINT word = 0; word < words; ++word) {
+            if (got[word] != late_shader_expected[word]) {
+                char message[128];
+                std::snprintf(message, sizeof(message), "thread %u stored %#x, expected %#x", word, got[word],
+                              late_shader_expected[word]);
+                throw std::runtime_error(message);
+            }
+        }
+        return;
+    }
+    throw std::runtime_error("the stand-in was never replaced by the finished compile");
+}
+
 void mixed_lane_scenario(ID3D12Device* device) {
     check_wave_shader(device, {lane_shader, sizeof(lane_shader)}, lane_shader_expected);
 }
@@ -1684,8 +1770,9 @@ void indirect_dispatch(ID3D12Device* device) {
 
 // A mesh dispatch signature is made exactly when the device reports mesh
 // shaders. Without them it must be refused: some drivers fault while
-// creating one instead of returning an error.
-void mesh_signature(ID3D12Device* device) {
+// creating one instead of returning an error. `without` requires a device
+// that reports none, as under TUXBOX_HOST_PROFILE=mesh=none.
+void check_mesh_signature(ID3D12Device* device, bool without) {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
     check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "mesh options");
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
@@ -1700,7 +1787,11 @@ void mesh_signature(ID3D12Device* device) {
         throw std::runtime_error("mesh dispatch signature refused on a device with mesh shaders");
     if (!mesh && (hr != E_NOTIMPL || command))
         throw std::runtime_error("mesh dispatch signature not refused on a device without mesh shaders");
+    if (without && mesh) throw std::runtime_error("the device still reports mesh shaders");
 }
+
+void mesh_signature(ID3D12Device* device) { check_mesh_signature(device, false); }
+void mesh_signature_none(ID3D12Device* device) { check_mesh_signature(device, true); }
 
 // The producer and ExecuteIndirect share a compute list. Only the final
 // readback waits on a CPU fence.
@@ -3456,6 +3547,7 @@ constexpr Scenario scenarios[] = {
     {L"gpu-indirect-dispatch", gpu_indirect_dispatch},
     {L"gpu-indirect-order", gpu_indirect_order},
     {L"mesh-signature", mesh_signature},
+    {L"mesh-signature-none", mesh_signature_none},
     {L"dispatch-wait", dispatch_wait},
     {L"texture-readback", texture_readback},
     {L"texture-publication", texture_publication},
@@ -3484,6 +3576,7 @@ constexpr Scenario scenarios[] = {
     {L"bindless-table-compute", bindless_table_compute},
     {L"raster-heap-stride", raster_heap_stride},
     {L"large-dispatch", large_dispatch},
+    {L"late-pipeline", late_pipeline},
     {L"compute-heap-stride", compute_heap_stride},
 };
 
@@ -3534,7 +3627,7 @@ std::string narrow(const wchar_t* text) {
 const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
                                              L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
                                              L"indirect-dispatch", L"gpu-indirect-dispatch", L"gpu-indirect-order",
-                                             L"mesh-signature",
+                                             L"mesh-signature", L"mesh-signature-none",
                                              L"dispatch-wait", L"texture-readback", L"texture-publication",
                                              L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim", L"unwritten-descriptors",
@@ -3545,7 +3638,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
                                              L"bindless-table-store", L"bindless-table-compute",
                                              L"raster-heap-stride", L"large-dispatch",
-                                             L"compute-heap-stride"};
+                                             L"compute-heap-stride", L"late-pipeline"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -3557,8 +3650,9 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its root-aware runtime shader worker.
-        // mixed-lane, raster-heap-stride, large-dispatch and compute-heap-stride also need the live compiler.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcscmp(scenario.name, L"compute-heap-stride") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
+        // mixed-lane, raster-heap-stride, large-dispatch, compute-heap-stride and late-pipeline also need the live compiler.
+        // mesh-signature-none needs a host profile without mesh shaders.
+        if (all && (!std::wcscmp(scenario.name, L"mesh-signature-none") || !std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcscmp(scenario.name, L"compute-heap-stride") || !std::wcscmp(scenario.name, L"late-pipeline") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
             continue;
         const auto name = narrow(scenario.name);
         try {

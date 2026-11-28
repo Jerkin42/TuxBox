@@ -38,6 +38,8 @@ pub(crate) struct PipelineData {
     pub(crate) image_writes: Option<std::sync::Arc<[tuxbox_dxbc::image_writes::TableSlot]>>,
     /// How a translated program runs a dispatch over 65,535 groups in a dimension.
     pub(crate) group_base: Option<std::sync::Arc<super::compute_split::GroupBase>>,
+    /// Set on a stand-in whose real compile is still running (see `late_pipeline`).
+    pub(crate) late: Option<Box<super::late_pipeline::Late>>,
 }
 
 const _: () = assert!(
@@ -255,7 +257,7 @@ unsafe fn create_pipeline_x_inner(
             let Some(code) = code else {
                 super::compute_table::capture_stage_root(bytes, &table.original);
                 crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, guest_threads, out) }.unwrap_or(E_NOTIMPL);
+                return unsafe { null_compute(this, root.map(|p| &p.native), desc, guest_threads, None, out) }.unwrap_or(E_NOTIMPL);
             };
             (Some(code), Some(table))
         }
@@ -325,7 +327,7 @@ unsafe fn create_pipeline_x_inner(
                         let Some(code) = code else {
                             super::compute_table::capture_stage_root(bytes, &r.state);
                             crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
-                            return unsafe { null_compute(this, Some(&r.native), desc, guest_threads, out) }
+                            return unsafe { null_compute(this, Some(&r.native), desc, guest_threads, None, out) }
                                 .unwrap_or(E_NOTIMPL);
                         };
                         (Some(code), strided_table)
@@ -352,7 +354,7 @@ unsafe fn create_pipeline_x_inner(
     if let Some(refusal) = unsupported_wave_size(this, code) {
         crate::diagnostics::compute_wave_failure(bytes, &refusal.detail);
         crate::failures::refusal("CS", &refusal.tag);
-        return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }
+        return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, None, out) }
             .unwrap_or(E_INVALIDARG);
     }
     let scene_root = if let Some(translated) = &translation {
@@ -403,7 +405,20 @@ unsafe fn create_pipeline_x_inner(
     // The driver compile must own its device, root signature, and shader bytes:
     // a deadline can return while that compile is still writing the GPU cache.
     let signature = core::mem::ManuallyDrop::into_inner(host.pRootSignature.clone());
+    // The bindings of the compiled pipeline. A stand-in keeps them for its
+    // compile to take over (see `late_pipeline`).
+    let compiled = |scene_root, reflected, sampler_root, group_base| PipelineData {
+        scene_root,
+        reflected,
+        compute_threads,
+        sampler_root,
+        image_writes: tuxbox_dxbc::image_writes::table_image_writes(bytes).map(Into::into),
+        group_base,
+        ..Default::default()
+    };
+    let slot = super::late_pipeline::Slot::<ID3D12PipelineState>::default();
     let compile = |shader: &[u8], label: &str| {
+        let slot = slot.clone();
         let device = this.native.clone();
         let signature = signature.clone();
         let shader = shader.to_vec();
@@ -417,7 +432,11 @@ unsafe fn create_pipeline_x_inner(
             let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
                 crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
             });
-            owned_compile(device, signature, shader, node_mask, flags)
+            let result = owned_compile(device, signature, shader, node_mask, flags);
+            if let Ok(pipeline) = &result {
+                slot.fill(pipeline.clone());
+            }
+            result
         })
     };
     // Boot 174727 substituted null pipelines for translated shaders whose
@@ -445,7 +464,9 @@ unsafe fn create_pipeline_x_inner(
                 // The original guest shader would be a second long driver compile.
                 crate::failures::refusal("CS", "driver compile deadline");
                 unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
+                let data = compiled(scene_root, reflected, sampler_root, group_base);
+                let late = Some(Box::new(super::late_pipeline::Late { slot: slot.clone(), data }));
+                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, late, out) }.unwrap_or(E_NOTIMPL);
             }
         }
     };
@@ -458,7 +479,9 @@ unsafe fn create_pipeline_x_inner(
             crate::big_stack::PipelineWait::Deferred => {
                 crate::failures::refusal("CS", "driver compile deadline");
                 unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
+                let data = compiled(scene_root, reflected, sampler_root, group_base);
+                let late = Some(Box::new(super::late_pipeline::Late { slot: slot.clone(), data }));
+                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, late, out) }.unwrap_or(E_NOTIMPL);
             }
         };
     }
@@ -467,7 +490,7 @@ unsafe fn create_pipeline_x_inner(
         if let Some(root) = root { super::compute_table::capture_stage_root(bytes, &root.state); }
         crate::diagnostics::compute_failure(bytes, error.code().0);
         crate::failures::refusal("CS", &format!("driver compile failed: {:#010x}", error.code().0));
-        if let Some(status) = unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) } {
+        if let Some(status) = unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, None, out) } {
             return status;
         }
     } else if let Some(table) = &reflected {
@@ -481,15 +504,7 @@ unsafe fn create_pipeline_x_inner(
             native,
             &PIPELINE,
             this,
-            PipelineData {
-                scene_root,
-                reflected,
-                compute_threads,
-                sampler_root,
-                image_writes: tuxbox_dxbc::image_writes::table_image_writes(bytes).map(Into::into),
-                group_base,
-                ..Default::default()
-            },
+            compiled(scene_root, reflected, sampler_root, group_base),
             out,
         )
     }
@@ -547,7 +562,7 @@ pub(super) fn owned_compile(
 /// Create a resource-free compute pipeline on the guest root (see `fallback`).
 unsafe fn null_compute(
     this: &Device, root: Option<&ID3D12RootSignature>, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    compute_threads: Option<[u32; 3]>, out: Out,
+    compute_threads: Option<[u32; 3]>, late: Option<Box<super::late_pipeline::Late>>, out: Out,
 ) -> Option<HRESULT> {
     use super::fallback::{Stage, bytecode, enabled, shader, substituted};
     if !enabled() { return None; }
@@ -571,7 +586,7 @@ unsafe fn null_compute(
         })
     });
     substituted("compute");
-    Some(unsafe { wrap_pageable(native, &PIPELINE, this, PipelineData { null_usage, compute_threads, ..Default::default() }, out) })
+    Some(unsafe { wrap_pageable(native, &PIPELINE, this, PipelineData { null_usage, compute_threads, late, ..Default::default() }, out) })
 }
 
 #[derive(Debug, PartialEq, Eq)]

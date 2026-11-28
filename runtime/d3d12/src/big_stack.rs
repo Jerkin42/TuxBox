@@ -84,7 +84,7 @@ where
         crate::diagnostics::log_once(&ANNOUNCED, || {
             format!(
                 "compute pipelines wait {}s, then return a null pipeline while the driver compile continues ({} at a time)",
-                deadline.as_secs(),
+                deadline.as_secs_f64(),
                 max_live()
             )
         });
@@ -97,14 +97,12 @@ fn pipeline_deadline() -> std::time::Duration {
     *DEADLINE.get_or_init(|| parse_deadline(std::env::var("TUXBOX_PIPELINE_DEADLINE").ok().as_deref()))
 }
 
+/// Whole or fractional seconds. A fraction lets a test make any large compile
+/// miss the deadline.
 fn parse_deadline(text: Option<&str>) -> std::time::Duration {
-    match text {
-        None => std::time::Duration::from_secs(20),
-        Some(text) => match text.parse::<u64>() {
-            Ok(seconds) => std::time::Duration::from_secs(seconds),
-            Err(_) => std::time::Duration::from_secs(20),
-        },
-    }
+    text.and_then(|text| text.trim().parse::<f64>().ok())
+        .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+        .unwrap_or(std::time::Duration::from_secs(20))
 }
 
 fn max_live() -> usize {

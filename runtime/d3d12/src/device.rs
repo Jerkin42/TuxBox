@@ -34,6 +34,7 @@ pub(crate) mod allocation;
 mod fallback;
 pub(crate) mod blas;
 pub(crate) mod compute;
+pub(crate) mod late_pipeline;
 mod compute_scene;
 mod compute_split;
 mod compute_table;

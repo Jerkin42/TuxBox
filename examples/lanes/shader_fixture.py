@@ -377,6 +377,41 @@ def heap_stride_compute_shader():
     ])
 
 
+# The `late-pipeline` program: each of 64 threads runs its index through a
+# chain of LATE_STEPS dependent `v_xor_b32`, `v_mul_u32_u24` and
+# `v_add_nc_u32` with literals, which DXC cannot fold, and stores the result as
+# word tid of u0. The chain makes the DXIL larger than the provider's large
+# compile size (512 KiB), so under a short pipeline deadline the program gets a
+# stand-in and its compile finishes later.
+LATE_STEPS = 60000
+
+
+def late_shader():
+    """The program and the word each thread stores."""
+    mask, seed, literals = 0xFFFFFFFF, 0x2545F491, []
+    code = [0xBE800304,              # s_mov_b32 s0, s4: table 0
+            0xBE810380,              # s_mov_b32 s1, 0
+            0xF4080200, 0xFA000000,  # s_load_dwordx4 s[8:11], s[0:1], 0: the u0 descriptor
+            0x7E020300]              # v_mov_b32 v1, v0
+    ops = (0x3A0202FF, 0x160202FF, 0x4A0202FF)  # v_xor_b32, v_mul_u32_u24, v_add_nc_u32 v1, literal, v1
+    for step in range(LATE_STEPS):
+        seed = (seed * 1103515245 + 12345) & mask
+        literals.append(seed | 1)
+        code += [ops[step % 3], seed | 1]
+    code += [0x34000082,              # v_lshlrev_b32 v0, 2, v0
+             0xBF8CC07F,              # s_waitcnt lgkmcnt(0)
+             0xE0701000, 0x80020100,  # buffer_store_dword v1, v0, s[8:11], 0 offen
+             0xBF810000]              # s_endpgm
+    expected = []
+    for tid in range(64):
+        x = tid
+        for step, literal in enumerate(literals):
+            kind = step % 3
+            x = x ^ literal if kind == 0 else ((literal & 0xFFFFFF) * (x & 0xFFFFFF)) & mask if kind == 1 else (x + literal) & mask
+        expected.append(x)
+    return uav_shader(code, width=64), expected
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -412,7 +447,14 @@ def header():
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n"
             + declaration("compute_heap_stride_shader", heap_stride_compute_shader())
             + f"constexpr unsigned compute_heap_stride_input_slot = {HEAP_STRIDE_INPUT_SLOT}u, compute_heap_stride_output_slot = {HEAP_STRIDE_OUTPUT_SLOT}u;\n"
-            + f"constexpr unsigned compute_heap_stride_bytes = {HEAP_STRIDE_RECORD_BYTES}u, compute_heap_stride_records = {HEAP_STRIDE_THREADS}u;\n")
+            + f"constexpr unsigned compute_heap_stride_bytes = {HEAP_STRIDE_RECORD_BYTES}u, compute_heap_stride_records = {HEAP_STRIDE_THREADS}u;\n"
+            + late_declarations())
+
+
+def late_declarations():
+    data, expected = late_shader()
+    words = ",".join(f"{word:#x}u" for word in expected)
+    return declaration("late_shader", data) + f"constexpr unsigned late_shader_expected[64] = {{{words}}};\n"
 
 
 if __name__ == "__main__":

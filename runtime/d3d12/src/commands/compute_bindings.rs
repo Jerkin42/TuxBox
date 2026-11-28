@@ -1,6 +1,7 @@
 //! Save the guest bindings displaced by an internal compute pass. Graphics
 //! root arguments other than tables and IA/OM/RS state survive the pass.
-use crate::device::compute::{ComputeTable, GroupBase, Pipeline as GuestPipeline, RootSource, SceneRoot, SceneSource};
+use crate::device::compute::{ComputeTable, GroupBase, RootSource, SceneRoot, SceneSource};
+use crate::device::late_pipeline::Resolved;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use windows::Win32::Foundation::E_INVALIDARG;
@@ -114,18 +115,18 @@ pub(super) enum Argument {
     Constants(BTreeMap<u32, u32>),
 }
 
-impl From<&GuestPipeline> for Pipeline {
-    fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone(), p.state.image_writes.clone(), p.state.group_base.clone())
+impl From<Resolved<'_>> for Pipeline {
+    fn from((native, state): Resolved<'_>) -> Self {
+        Self::Regular(native.clone(), state.scene_root.clone(), state.reflected.clone(), state.raster_table.clone(), state.compute_threads, state.sampler_root.clone(), state.image_writes.clone(), state.group_base.clone())
     }
 }
 
 impl Bindings {
-    pub(super) fn new(initial: Option<&GuestPipeline>) -> Self {
+    pub(super) fn new(initial: Option<Resolved<'_>>) -> Self {
         Self {
             pipeline: initial.map(Pipeline::from),
-            draw_trace: initial.and_then(|p| p.state.draw_trace.clone()),
-            null_usage: initial.and_then(|p| p.state.null_usage.clone()),
+            draw_trace: initial.and_then(|(_, state)| state.draw_trace.clone()),
+            null_usage: initial.and_then(|(_, state)| state.null_usage.clone()),
             ..Default::default()
         }
     }
