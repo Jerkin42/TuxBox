@@ -46,6 +46,7 @@ CASES = [
     ("wave32_64t_dyn_sgpr_31", 64, 32, 31, False, "broadcast"),
     ("wave32_mixed_dynamic_11", 32, 32, 11, False, "mixed"),
     ("wave32_mixed_empty_exec", 32, 32, 11, False, "mixed_empty"),
+    ("wave32_mixed_lds_dpp_11", 32, 32, 11, False, "mixed_lds_dpp"),
 ]
 
 
@@ -56,11 +57,18 @@ def seed_and_expected(lanes, wave_width, target_lane, skip_last, mode, values):
     for lane in range(lanes):
         src = (lane & ~(wave_width - 1)) | target_lane
         val = values[src]
-        if mode in ("mixed", "mixed_empty"):
+        if mode in ("mixed", "mixed_empty", "mixed_lds_dpp"):
             written = 0x5a5a31f2
-            vector_value = written if mode == "mixed" and lane == target_lane else lane + 17
-            broadcast = written if mode == "mixed" else 3
-            expected[VIEW + lanes + lane] = broadcast ^ vector_value
+
+            def v6(index):
+                vector_value = written if mode != "mixed_empty" and index == target_lane else index + 17
+                return (3 if mode == "mixed_empty" else written) ^ vector_value
+            if mode == "mixed_lds_dpp":
+                # Group memory and a quad permute both give the neighbour's v6.
+                other = v6(lane ^ 1)
+                expected[VIEW + lanes + lane] = (v6(lane) ^ (other << 1) ^ (other << 2)) & 0xFFFFFFFF
+            else:
+                expected[VIEW + lanes + lane] = v6(lane)
         elif mode == "mbcnt":
             prefix = lane if lane < 31 else 31
             out = ((prefix & 0xff) << 24) | (val & 0x00ffffff)

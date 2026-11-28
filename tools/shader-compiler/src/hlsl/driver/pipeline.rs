@@ -300,7 +300,9 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         required_wave_size
     };
     let required_wave_size = if resolve_wave32 {
-        if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
+        // Mixed lane storage pins host lanes to the guest's, so a quad exchange reads the
+        // lane it names. The ray resolve has no verified exchange.
+        if matches!(required_wave_size, Some(64)) || !mixed_lane_wave32 && insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
         }
         Some(32)
