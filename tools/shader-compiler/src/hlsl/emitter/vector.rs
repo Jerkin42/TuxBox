@@ -183,6 +183,13 @@ impl<'a> Emitter<'a> {
         if ins.raw.first().is_some_and(|w| w >> 26 == 0x35 && w & 0x7800 != 0) && half_operands && !reads_op_sel {
             return Err("unsupported 16-bit operand select".into());
         }
+        // These are translated before SDWA operand selection (`emit_sdwa`) and would ignore it.
+        if ins.aux.sdwa.is_some() && matches!(m.as_str(), "v_add_co_ci_u32" | "v_sub_co_ci_u32"
+            | "v_subrev_co_ci_u32" | "v_fmac_f16" | "v_fmamk_f16" | "v_fmaak_f16"
+            | "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32")
+        {
+            return Err("unsupported SDWA form".into());
+        }
         // ---- half-float arithmetic: operands are f16 in the low 16 bits (inline float
         // constants denote the half-float of that value); the result is written as f16.
         // VOP3 forms carry per-source abs/neg modifiers and a result clamp/output modifier,
