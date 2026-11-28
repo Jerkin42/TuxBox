@@ -829,28 +829,54 @@ def rounded_toward_zero(bits):
 
 def mixed(selection):
     """The sources of a MIX instruction as f32 bit patterns: `f` takes the word
-    as an f32, `l` and `h` its low or high half as an f16, which an f32 holds exactly."""
+    as an f32, `l` and `h` its low or high half as an f16, which an f32 holds exactly.
+    `1` is the inline constant 1.0 read as an f16 source."""
     def sources(a, b, c):
-        return [word if pick == "f" else to_bits(half_float(word >> (16 if pick == "h" else 0)))
+        return [word if pick == "f" else to_bits(1.0) if pick == "1"
+                else to_bits(half_float(word >> (16 if pick == "h" else 0)))
                 for pick, word in zip(selection, (a, b, c))]
     return sources
 
 
-def mix_to_half(selection):
+def clamped(value):
+    """CLAMP: the result held to [0, 1], with NaN as 0. The sign of a zero is left open."""
+    value = to_float(value)
+    return 0.0 if math.isnan(value) else min(max(value, 0.0), 1.0)
+
+
+def mix_f32(selection):
+    sources = mixed(selection.rstrip("c"))
+    if not selection.endswith("c"):
+        return lambda a, b, c: multiply_add(*sources(a, b, c))
+
     def model(a, b, c):
-        values = [to_float(x) for x in mixed(selection)(a, b, c)]
-        if not all(math.isfinite(v) for v in values):
-            return round_half(values[0] * values[1] + values[2])
-        return round_half(Fraction(values[0]) * Fraction(values[1]) + Fraction(values[2]))
+        expected = multiply_add(*sources(a, b, c))
+        bits = [to_bits(clamped(x)) for x in (expected.bits, *expected.also)]
+        return Float(bits[0], any_zero=True, also=tuple(bits[1:]))
     return model
 
 
-# name@sources: the instruction with each source taken as `mixed` describes.
+def mix_to_half(selection):
+    clamp = selection.endswith("c")
+
+    def model(a, b, c):
+        values = [to_float(x) for x in mixed(selection.rstrip("c"))(a, b, c)]
+        if not all(math.isfinite(v) for v in values):
+            value = values[0] * values[1] + values[2]
+        else:
+            value = Fraction(values[0]) * Fraction(values[1]) + Fraction(values[2])
+        if clamp:
+            value = 0.0 if value != value else Fraction(min(max(value, 0), 1))
+        return round_half(value)
+    return model
+
+
+# name@sources: the instruction with each source taken as `mixed` describes,
+# and a trailing `c` for CLAMP.
 MIX = {
-    **{f"v_fma_mix_f32@{sel}": (3, lambda a, b, c, sel=sel: multiply_add(*mixed(sel)(a, b, c)))
-       for sel in ("fff", "lll", "hlf", "fhl")},
-    **{f"v_fma_mixlo_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff", "lhf")},
-    **{f"v_fma_mixhi_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff")},
+    **{f"v_fma_mix_f32@{sel}": (3, mix_f32(sel)) for sel in ("fff", "lll", "hlf", "fhl", "fffc", "hlfc", "f1f")},
+    **{f"v_fma_mixlo_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff", "lhf", "lhfc")},
+    **{f"v_fma_mixhi_f16@{sel}": (3, mix_to_half(sel)) for sel in ("lll", "hhh", "fff", "hhhc")},
 }
 def byte_pack(a, b, c):
     """`v_cvt_pk_u8_f32`: the float as a byte, in the byte of the third source the
@@ -965,13 +991,16 @@ def lines_for(name, destination):
             for line in lines]
     if name in MIX:
         instruction, selection = name.split("@")
+        clamp = " clamp" if selection.endswith("c") else ""
+        selection = selection.rstrip("c")
         low = ",".join(str(int(pick == "h")) for pick in selection)
         high = ",".join(str(int(pick != "f")) for pick in selection)
+        sources = ", ".join("1.0" if pick == "1" else f"v{4 + j}" for j, pick in enumerate(selection))
         # Only one half of the destination is written, so the other is shifted or masked away.
         keep = {"v_fma_mixlo_f16": [f"v_and_b32_e32 v{destination}, 0xffff, v{destination}"],
                 "v_fma_mixhi_f16": [f"v_lshrrev_b32_e32 v{destination}, 16, v{destination}"]}.get(instruction, [])
         return [f"v_mov_b32_e32 v{destination}, 0",
-                f"{instruction} v{destination}, v4, v5, v6 op_sel:[{low}] op_sel_hi:[{high}]"] + keep
+                f"{instruction} v{destination}, {sources} op_sel:[{low}] op_sel_hi:[{high}]{clamp}"] + keep
     if name in HALF:
         sources = ", ".join(f"v{4 + j}" for j in range(HALF[name][0]))
         if name == "v_fmac_f16":
