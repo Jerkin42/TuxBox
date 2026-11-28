@@ -66,6 +66,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |
 | `raster-heap-stride` | A console vertex program reading its positions by index from a structured buffer in the resource heap ([raster tables](#raster-tables)); not part of `all` |
+| `large-dispatch` | A console compute program that stores its group ID, dispatched with 70,000 groups across and then 70,000 down ([large dispatches](#large-dispatches)); not part of `all` |
 | `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
 | `compute-root-srv` | A console compute program under three tables and a root SRV stores through a table slot that the title's root declares an SRV ([compute roots](#a-compute-root-with-a-root-srv-after-its-tables)) |
 | `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
@@ -163,6 +164,18 @@ python tuxbox.py verify --only lanes-compute-root --output build/lanes-compute-r
 ```
 
 It runs on the Proton backend and removes only these programs' cache entries from the prefix.
+
+## Large dispatches
+
+A console dispatch can have more groups in a dimension than the 65,535 a desktop `Dispatch` allows. The provider records it as several dispatches of at most 65,535 groups in each dimension that is over, and divides no other. Before each one it sets the console group ID that dispatch starts at in three root constants (`b0, space32766`) appended to the pipeline's root. The program is translated again against that root, and the translation adds the constants to every group ID it reads, so each group runs with its console ID. Group counts a program reads come from the title's own constants, which keep the console values. The variant is made at the first such dispatch. A pipeline that cannot take the group base, such as an inline ray-query program, a program the provider runs untranslated or a stream-created pipeline, still fails the list, with the reason in the log. `ExecuteIndirect` arguments over the limit are written by the GPU and are not split, and neither is `DispatchMesh`.
+
+The `large-dispatch` scenario runs a hand-written console program (`shader_fixture.py`; not taken from any game) that stores its group ID and a marker at record x + 2y of a raw UAV. It dispatches 70,000 x 1 x 1 groups, then 2 x 70,000 x 1, and checks every word of all 140,000 records, including those the first dispatch leaves unwritten. Without the split the list fails to close. `verify` runs it with the host worker and fails unless the provider made the variant, split the dispatch in two and substituted no stand-in.
+
+```sh
+python tuxbox.py verify --only lanes-large-dispatch --output build/lanes-large-dispatch.json
+```
+
+It runs on the Proton backend and removes only this program's cache entries from the prefix.
 
 ## Deterministic replay
 

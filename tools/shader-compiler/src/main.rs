@@ -296,7 +296,9 @@ fn run() -> Result<(), Error> {
         println!("entry={name}");
         return Ok(());
     }
-    let shader = extract(&source_bytes)?;
+    let mut shader = extract(&source_bytes)?;
+    // A root ending with the runtime's group base is a split dispatch's variant.
+    let group_base = tuxbox_xshader::group_base::take(&mut shader);
     let (hlsl, model) = translate(
         &shader,
         consumer.as_deref(),
@@ -304,6 +306,11 @@ fn run() -> Result<(), Error> {
         stencil_target,
         wave32_host,
     )?;
+    let hlsl = if group_base {
+        tuxbox_xshader::group_base::offset(&hlsl).map_err(Error::Unsupported)?
+    } else {
+        hlsl
+    };
     // DXC needs about 1.1 GB of memory per MB of generated HLSL at -O0: two
     // 10 MB programs took 11 GB each and starved the running title. Refuse such
     // a translation rather than hand it to the compiler.

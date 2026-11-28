@@ -4,6 +4,7 @@ All are small hand-written console programs, not taken from any game. One is a
 `v_mov_b32` and `s_endpgm` with an empty root signature embedded. Another sums
 the lane numbers of each 64-lane console wave and writes a word per thread. The
 two `compute-root` programs carry no root and store one word through table 1.
+The `large-dispatch` program stores its group ID.
 """
 import hashlib
 from pathlib import Path
@@ -304,6 +305,34 @@ def bindless_table_store_shader():
     ])
 
 
+# The `large-dispatch` program, checked with `llvm-mc -mcpu=gfx1030 -show-encoding`.
+# Under its root of one table the group ID arrives in s5, s6 and s7. Every
+# thread of a group stores the ID and GROUP_MARK as four words at record
+# x + 2y, so a dispatch two groups wide covers each record once.
+GROUP_MARK = 0x6B1D0000
+GROUP_CODE = (
+    0xBE800304,                  # s_mov_b32 s0, s4: table 0
+    0xBE810380,                  # s_mov_b32 s1, 0
+    0xF4080200, 0xFA000000,      # s_load_dwordx4 s[8:11], s[0:1], 0: the u0 descriptor
+    0x8F0C8106,                  # s_lshl_b32 s12, s6, 1
+    0x800C050C,                  # s_add_u32 s12, s12, s5
+    0x8F0C840C,                  # s_lshl_b32 s12, s12, 4
+    0x7E020205,                  # v_mov_b32 v1, s5
+    0x7E040206,                  # v_mov_b32 v2, s6
+    0x7E060207,                  # v_mov_b32 v3, s7
+    0x7E0802FF, GROUP_MARK,      # v_mov_b32 v4, GROUP_MARK
+    0x7E00020C,                  # v_mov_b32 v0, s12
+    0xBF8CC07F,                  # s_waitcnt lgkmcnt(0)
+    0xE0781000, 0x80020100,      # buffer_store_dwordx4 v[1:4], v0, s[8:11], 0 offen
+    0xBF810000,                  # s_endpgm
+)
+
+
+def group_shader():
+    """A program that stores its group ID, for dispatches over 65,535 groups."""
+    return uav_shader(list(GROUP_CODE), width=64)
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -333,6 +362,8 @@ def header():
             + declaration("bindless_table_store_shader", bindless_table_store_shader())
             + f"constexpr unsigned bindless_table_slot = {BINDLESS_TABLE_SLOT}, "
               f"bindless_table_expected = {BINDLESS_TABLE_EXPECTED:#x};\n"
+            + declaration("group_shader", group_shader())
+            + f"constexpr unsigned group_shader_mark = {GROUP_MARK:#x};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
 

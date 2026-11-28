@@ -35,6 +35,7 @@ mod fallback;
 pub(crate) mod blas;
 pub(crate) mod compute;
 mod compute_scene;
+mod compute_split;
 mod compute_table;
 mod mesh_table;
 pub(crate) mod depth;

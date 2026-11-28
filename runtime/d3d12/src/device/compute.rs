@@ -8,6 +8,7 @@ use windows::core::{GUID, HRESULT, Interface};
 
 pub(crate) use super::compute_table::ComputeTable;
 pub(crate) use super::compute_scene::{RootSource, SceneRoot, SceneSource};
+pub(crate) use super::compute_split::GroupBase;
 
 static ROOT: Slots<8> = child_slots::<ID3D12RootSignature, RootSource, 8>();
 pub(crate) type Root = Proxy<ID3D12RootSignature, RootSource>;
@@ -35,6 +36,8 @@ pub(crate) struct PipelineData {
     /// stores all trace to such descriptors. `None` when that is not known:
     /// the pipeline may then write any texture it can reach.
     pub(crate) image_writes: Option<std::sync::Arc<[tuxbox_dxbc::image_writes::TableSlot]>>,
+    /// How a translated program runs a dispatch over 65,535 groups in a dimension.
+    pub(crate) group_base: Option<std::sync::Arc<super::compute_split::GroupBase>>,
 }
 
 const _: () = assert!(
@@ -222,6 +225,7 @@ unsafe fn create_pipeline_x_inner(
     };
     let guest_threads = tuxbox_dxbc::shader_compute_threads(bytes);
     let mut sampler_root = None;
+    let mut sampler_layout = None;
     let (translation, reflected) = match layout {
         Some(TableLayout::Reflected(table)) => {
             // Embedded RTS0 cannot be replaced. The translator reads that original
@@ -284,10 +288,11 @@ unsafe fn create_pipeline_x_inner(
             let extended = root.and_then(|r| super::compute_table::sampler_root(
                 &this.native, &r.state, bytes, desc.NodeMask).ok().flatten());
             match extended.and_then(|(native, layout)| {
-                super::shader_cache::compute_with_root(bytes, layout.payload()).map(|code| (code, native))
+                super::shader_cache::compute_with_root(bytes, layout.payload()).map(|code| (code, native, layout))
             }) {
-                Some((code, native)) => {
+                Some((code, native, layout)) => {
                     sampler_root = Some(native);
+                    sampler_layout = Some(layout);
                     (Some(code), None)
                 }
                 // Only the pipeline root binds a program without an embedded one.
@@ -345,6 +350,15 @@ unsafe fn create_pipeline_x_inner(
     } else {
         None
     };
+    // A split dispatch runs the program on its pipeline root with the group
+    // base appended. A ray-query program's scene root is not extended.
+    let mut group_base = translation.as_ref().filter(|_| scene_root.is_none()).map(|_| {
+        let root = reflected.as_ref().map(|t| t.layout.clone()).or(sampler_layout)
+            .or_else(|| root.map(|r| r.state.clone()))
+            .unwrap_or_else(|| RootSource::new(bytes));
+        let waves = super::host_profile::wave_range(this);
+        std::sync::Arc::new(super::compute_split::GroupBase::new(&this.native, bytes, root, desc.NodeMask, desc.Flags, waves))
+    });
     let source = super::shader_cache::source_digest(bytes);
     let label = compute_compile_label(source.as_deref(), translation.as_ref().map(|t| t.request.as_str()), code.len());
     let original_label = compute_compile_label(source.as_deref(), None, bytes.len());
@@ -418,6 +432,7 @@ unsafe fn create_pipeline_x_inner(
     if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err() {
         // Structural checks cannot validate DXIL instructions or root bindings.
         // Let the adapter handle the original guest shader if it rejects the cache.
+        group_base = None;
         native = match compile(bytes, &original_label) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
@@ -452,6 +467,7 @@ unsafe fn create_pipeline_x_inner(
                 compute_threads,
                 sampler_root,
                 image_writes: tuxbox_dxbc::image_writes::table_image_writes(bytes).map(Into::into),
+                group_base,
                 ..Default::default()
             },
             out,
@@ -484,7 +500,7 @@ pub(super) fn large_deferred(
 /// The guest descriptor can be released as soon as the caller returns. A
 /// deadline does that while the driver is still compiling, so the bytes and
 /// the root signature in that descriptor must not be the ones the driver reads.
-fn owned_compile(
+pub(super) fn owned_compile(
     device: ID3D12Device,
     root: Option<ID3D12RootSignature>,
     shader: Vec<u8>,
