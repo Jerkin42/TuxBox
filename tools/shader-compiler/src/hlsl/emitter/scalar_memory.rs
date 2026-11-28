@@ -190,6 +190,10 @@ impl<'a> Emitter<'a> {
         let m = ins.mnemonic.as_str();
         let s = &ins.src;
         let d = ins.dst.first().cloned();
+        // LDS (bit 13) sends the loaded data to group shared memory instead of registers.
+        if ins.raw[0] & (1 << 13) != 0 {
+            return Err("FLAT LDS (load to LDS) unsupported".into());
+        }
         match ins.enc {
             Enc::Flat if m == "flat_load_ushort" => {
                 code_table::halfword(&self.insns, idx, self.ex.isa.len(), self.ex.isa_data.len())

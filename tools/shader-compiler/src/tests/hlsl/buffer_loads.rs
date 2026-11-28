@@ -238,3 +238,13 @@ fn buffer_loads_for_the_gpu_check() {
     }
     println!("BEGIN_HLSL\n{text}END_HLSL");
 }
+
+#[test]
+fn a_load_to_group_memory_is_refused() {
+    // flat_load_dword v7, v[4:5] offset:24 from the program's own table, then with LDS.
+    let code = |first: u32| program(0, Some(CODE_TABLE), 32, &[OWN_ADDRESS[0], OWN_ADDRESS[1], OWN_ADDRESS[2], first, 0x077d_0004]);
+    assert!(super::translate(&code(0xdc30_0018)).is_ok());
+    let error = super::translate(&code(0xdc30_2018)).err().unwrap();
+    assert!(error.contains("FLAT LDS"), "{error}");
+}
+
