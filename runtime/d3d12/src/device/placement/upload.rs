@@ -1,5 +1,5 @@
 //! Fence a private copy queue against the guest queues that read these textures.
-use super::{Texture, committed, lock};
+use super::{Digest, Texture, committed, lock};
 use core::mem::ManuallyDrop;
 use std::{collections::VecDeque, sync::Arc};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, HANDLE};
@@ -10,6 +10,8 @@ pub(super) struct Change {
     pub(super) texture: Arc<Texture>,
     pub(super) level: usize,
     pub(super) bytes: Vec<u8>,
+    /// The digest of `bytes`, recorded once their upload is queued.
+    pub(super) digest: Digest,
 }
 
 // These COM objects must survive the asynchronous copy, even if the guest
@@ -117,7 +119,8 @@ impl Transfer {
         }
         for change in changes {
             let mut state = lock(&change.texture.contents);
-            self.scratch = state.store(change.level, change.bytes);
+            state.previous[change.level] = Some(change.digest);
+            self.scratch = change.bytes;
             state.uploaded = tick;
             state.readers.clear();
         }

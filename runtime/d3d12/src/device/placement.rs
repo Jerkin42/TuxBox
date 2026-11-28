@@ -1,5 +1,6 @@
 //! Keep CPU-backed tiled Xbox textures coherent with their desktop images.
 mod descriptors;
+mod digest;
 mod guarded_copy;
 mod publication;
 mod upload;
@@ -8,6 +9,7 @@ mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
 pub(crate) use guarded_copy::recover as recover_guarded_copy;
 pub(crate) use publication::QueueAccess;
+use digest::Digest;
 
 use super::Device;
 use core::{ffi::c_void, ops::Range};
@@ -94,36 +96,11 @@ struct Mip {
 
 #[derive(Default)]
 struct Contents {
-    // An exact copy makes writes to shared pages and all-zero rewrites observable.
-    previous: Vec<Vec<u8>>,
+    // Each mip's guest bytes as last uploaded or published. `None` until then,
+    // so a first upload of zeros is still observed.
+    previous: Vec<Option<Digest>>,
     uploaded: u64,
     readers: Vec<(ID3D12Fence, u64)>,
-}
-
-impl Contents {
-    /// Keep `bytes` as mip `level`'s snapshot and return the one it replaces,
-    /// for reuse as scratch.
-    fn store(&mut self, level: usize, bytes: Vec<u8>) -> Vec<u8> {
-        // The bytes arrive in the upload scratch buffer, which keeps the
-        // capacity of the largest mip it has compared, with those pages
-        // touched. Snapshots last as long as their texture, so let the system
-        // reclaim the whole pages past this mip's bytes. Shrinking would not:
-        // Wine shrinks a large heap block in place and keeps its pages.
-        let start = (bytes.as_ptr() as usize + bytes.len()).next_multiple_of(4096);
-        let end = (bytes.as_ptr() as usize + bytes.capacity()) & !4095;
-        if end >= start + (64 << 10) {
-            // SAFETY: whole pages inside the Vec's own allocation and past its
-            // length. MEM_RESET keeps them committed; only their contents,
-            // which the Vec does not read, are discarded.
-            unsafe {
-                windows::Win32::System::Memory::VirtualAlloc(
-                    Some(start as *const c_void), end - start,
-                    windows::Win32::System::Memory::MEM_RESET, windows::Win32::System::Memory::PAGE_READWRITE,
-                );
-            }
-        }
-        std::mem::replace(&mut self.previous[level], bytes)
-    }
 }
 
 struct Alias {
@@ -337,7 +314,7 @@ impl Texture {
             });
         }
         let contents = Mutex::new(Contents {
-            previous: vec![Vec::new(); mips.len()],
+            previous: vec![None; mips.len()],
             ..Default::default()
         });
         Ok(Arc::new(Self {
@@ -372,14 +349,16 @@ impl Texture {
         let mut contents = lock(&self.contents);
         for (level, mip) in self.mips.iter().enumerate() {
             if !self.snapshot_mip(mip, scratch)? {
-                contents.previous[level].clear();
+                contents.previous[level] = None;
                 continue;
             }
-            if *scratch != contents.previous[level] {
+            let digest = Digest::of(scratch);
+            if contents.previous[level] != Some(digest) {
                 changes.push(upload::Change {
                     texture: self.clone(),
                     level,
                     bytes: std::mem::take(scratch),
+                    digest,
                 });
             }
         }
