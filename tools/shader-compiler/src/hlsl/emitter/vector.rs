@@ -174,6 +174,15 @@ impl<'a> Emitter<'a> {
             );
             return self.ws(&d, &e);
         }
+        // VOP3 OP_SEL picks the high half of a 16-bit source or result. Only these forms
+        // read it; the others would silently use the low half. Lowered SDWA forms are
+        // also `Enc::Vop3` but keep their own words, so test the encoding prefix.
+        let half_operands = ["_f16", "_i16", "_u16", "_b16"].iter().any(|t| m.contains(t));
+        let reads_op_sel = int16::handles(&m)
+            || matches!(m.as_str(), "v_pack_b32_f16" | "v_fma_f16" | "v_mad_u32_u16" | "v_mad_i32_i16");
+        if ins.raw.first().is_some_and(|w| w >> 26 == 0x35 && w & 0x7800 != 0) && half_operands && !reads_op_sel {
+            return Err("unsupported 16-bit operand select".into());
+        }
         // ---- half-float arithmetic: operands are f16 in the low 16 bits (inline float
         // constants denote the half-float of that value); the result is written as f16.
         // VOP3 forms carry per-source abs/neg modifiers and a result clamp/output modifier,
