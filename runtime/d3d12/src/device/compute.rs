@@ -297,13 +297,33 @@ unsafe fn create_pipeline_x_inner(
                 // stand-in keeps the translator's refusal on record.
                 None => match root {
                     Some(r) if super::shader_cache::rootless_compute(bytes) => {
-                        let Some(code) = super::shader_cache::compute_with_root(bytes, r.state.payload()) else {
+                        let mut strided_table: Option<std::sync::Arc<ComputeTable>> = None;
+                        let code = super::shader_cache::compute_with_root(bytes, r.state.payload())
+                            .or_else(|| {
+                                // A heap-indexed IDXEN access can only be expressed
+                                // with each slot's buffer stride: retry on the same
+                                // root with the stride table appended.
+                                if !super::shader_cache::refused_for_heap_strides(bytes, r.state.payload()) {
+                                    return None;
+                                }
+                                let Ok(TableLayout::Reflected(strided)) = super::compute_table::reflected_with_strides(
+                                    &this.native, &r.state, Program::Compute(bytes), desc.NodeMask) else {
+                                    return None;
+                                };
+                                let code = super::shader_cache::compute_with_root(bytes, strided.layout.payload())?;
+                                static FIRST: std::sync::Once = std::sync::Once::new();
+                                crate::diagnostics::log_once(&FIRST, || "translated a compute shader with the heap stride table".to_string());
+                                super::shader_cache::superseded(bytes, r.state.payload());
+                                strided_table = Some(strided);
+                                Some(code)
+                            });
+                        let Some(code) = code else {
                             super::compute_table::capture_stage_root(bytes, &r.state);
                             crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
                             return unsafe { null_compute(this, Some(&r.native), desc, guest_threads, out) }
                                 .unwrap_or(E_NOTIMPL);
                         };
-                        (Some(code), None)
+                        (Some(code), strided_table)
                     }
                     _ => (super::shader_cache::prepared_compute(bytes).or_else(|| {
                         super::shader_cache::compute_with_root(bytes, root?.state.payload())
