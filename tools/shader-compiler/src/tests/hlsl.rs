@@ -1034,3 +1034,13 @@ fn mixed_lane_wave32_refuses_unverified_control_flow() {
     let error = mixed_lane_compute([32, 1, 1], &words).err().unwrap();
     assert!(error.contains("whole-wave scalar dispatch"), "{error}");
 }
+
+#[test]
+fn global_data_share_accesses_are_refused() {
+    // ds_write_b32 v4, v5 and ds_read_b32 v7, v4, each also with GDS.
+    for words in [[0xd834_0000u32, 0x0000_0504], [0xd8d8_0000, 0x0700_0004]] {
+        assert!(float64::tests::translate(Stage::Compute, &words).is_ok(), "{words:x?}");
+        let error = float64::tests::translate(Stage::Compute, &[words[0] | 1 << 17, words[1]]).unwrap_err();
+        assert!(error.contains("GDS is unsupported"), "{error}");
+    }
+}

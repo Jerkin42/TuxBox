@@ -38,7 +38,8 @@ fn bit_mask_mode_is_unchanged() {
 fn other_high_offset_bits_and_gds_stay_refused() {
     for (offset, extra) in [(0x8100, 0), (0xe000, 0), (0xffff, 0), (0x801b, 1 << 16), (0x041f, 1 << 17)] {
         let error = swizzle(offset, extra).unwrap_err();
-        assert!(error.contains("unsupported compute DS swizzle encoding"), "{offset:#x}/{extra:#x}: {error}");
+        let reason = if extra == 1 << 17 { "GDS is unsupported" } else { "unsupported compute DS swizzle encoding" };
+        assert!(error.contains(reason), "{offset:#x}/{extra:#x}: {error}");
     }
 }
 
