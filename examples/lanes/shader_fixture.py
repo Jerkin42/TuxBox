@@ -304,6 +304,51 @@ def bindless_table_store_shader():
     ])
 
 
+
+# The `compute-heap-stride` program, checked with `llvm-mc -mcpu=gfx1030
+# -show-encoding`. It is a root-less compute program: each thread takes the
+# thread number, indexes the input structured buffer in the resource heap with
+# it (an IDXEN raw load, which needs the buffer's record stride) and stores the
+# word it found into the same record of the output structured buffer, through
+# the other heap descriptor (a byte-offset store one record per thread). The
+# load cannot be expressed without the stride: the runtime has to retry the
+# translation with the heap stride table appended, as it does for the Reflected
+# and Original arms. The heap base arrives in s2 (the one FSSM class-5 user
+# record) and the descriptors are loaded with a 32-byte step, the way the
+# console stores a heap slot's descriptor there.
+HEAP_STRIDE_INPUT_SLOT = 100
+HEAP_STRIDE_OUTPUT_SLOT = 110
+HEAP_STRIDE_THREADS = 64
+HEAP_STRIDE_RECORD_BYTES = 32
+
+
+def heap_stride_compute_shader():
+    code = [
+        0xB0140000 | HEAP_STRIDE_INPUT_SLOT,  # s_movk_i32 s20, the input's heap slot
+        0x8F158514,                           # s_lshl_b32 s21, s20, 5   (slot * 32 bytes)
+        0xF4080201, 0x2A000000,               # s_load_dwordx4 s[8:11], s[2:3], s21
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0xE0302000, 0x80020400,               # buffer_load_dword v4, v0, s[8:11], 0 idxen
+        0xBF8C3F70,                           # s_waitcnt vmcnt(0)
+        0xB0140000 | HEAP_STRIDE_OUTPUT_SLOT,  # s_movk_i32 s20, the output's heap slot
+        0x8F158514,                           # s_lshl_b32 s21, s20, 5   (slot * 32 bytes)
+        0xF4080601, 0x2A000000,               # s_load_dwordx4 s[24:27], s[2:3], s21
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0x34120085,                           # v_lshlrev_b32 v9, 5, v0
+        0xE0701000, 0x80060409,               # buffer_store_dword v4, v9, s[24:27], 0
+        0xBF810000,                           # s_endpgm
+    ]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, HEAP_STRIDE_THREADS, 1, 1)
+    psv = pack([48]) + info + pack([0])
+    # FSSM: one class-5 user record, the heap base (s2). No used-resource rows.
+    return stage_container(0x50060, image(7, code, [(5, 0, 1, 0, 2)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", psv),
+    ])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -334,7 +379,10 @@ def header():
             + f"constexpr unsigned bindless_table_slot = {BINDLESS_TABLE_SLOT}, "
               f"bindless_table_expected = {BINDLESS_TABLE_EXPECTED:#x};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
-            + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
+            + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n"
+            + declaration("compute_heap_stride_shader", heap_stride_compute_shader())
+            + f"constexpr unsigned compute_heap_stride_input_slot = {HEAP_STRIDE_INPUT_SLOT}u, compute_heap_stride_output_slot = {HEAP_STRIDE_OUTPUT_SLOT}u;\n"
+            + f"constexpr unsigned compute_heap_stride_bytes = {HEAP_STRIDE_RECORD_BYTES}u, compute_heap_stride_records = {HEAP_STRIDE_THREADS}u;\n")
 
 
 if __name__ == "__main__":

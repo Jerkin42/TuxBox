@@ -358,6 +358,12 @@ impl Bindings {
                 }
                 if let Some((slot, address)) = strides {
                     list.SetComputeRootShaderResourceView(slot, address);
+                    static IDENTITY: std::sync::Once = std::sync::Once::new();
+                    static PAGED: std::sync::Once = std::sync::Once::new();
+                    let (site, kind) = if arena.is_some() { (&PAGED, "paged") } else { (&IDENTITY, "identity") };
+                    crate::diagnostics::log_once(site, || {
+                        format!("bound {kind} resource descriptor stride table at compute root slot {slot}")
+                    });
                 }
                 if let Some((slot, address)) = index_map {
                     list.SetComputeRootShaderResourceView(slot, address);
