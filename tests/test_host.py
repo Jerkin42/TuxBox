@@ -535,7 +535,8 @@ class NvidiaShaderCache(unittest.TestCase):
             small = self.driver_cache(cache, "small", [(32, 968)], 1000 + (3 << 20))
             before = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in cache.rglob("*.*")}
             reports = []
-            configure_nvidia_shader_cache({"WINEPREFIX": str(prefix)}, reports.append)
+            own = {"__GL_SHADER_DISK_CACHE_APP_NAME": "mine"}
+            configure_nvidia_shader_cache({"WINEPREFIX": str(prefix), **own}, reports.append)
             self.assertEqual(len(reports), 3)
             self.assertIn(f"{large} has stopped being indexed: 3,824 MiB of its 7.7 GiB is past the end", reports[1])
             self.assertIn(f"{small} has stopped being indexed: 3 MiB of its 0.0 GiB is past the end", reports[2])
@@ -545,6 +546,34 @@ class NvidiaShaderCache(unittest.TestCase):
             explicit = []
             configure_nvidia_shader_cache({"__GL_SHADER_DISK_CACHE_PATH": str(cache)}, explicit.append)
             self.assertEqual(explicit[1:], reports[1:])
+
+    def test_a_launch_writes_a_file_with_room_and_reads_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            cache = prefix / "shadercache"
+
+            def launch(**extra):
+                env = {"WINEPREFIX": str(prefix), **extra}
+                configure_nvidia_shader_cache(env)
+                return (env.get("__GL_SHADER_DISK_CACHE_APP_NAME"),
+                        env.get("__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"))
+
+            self.assertEqual(launch(), ("tuxbox1", None))
+            # The driver's own file, past its index, is still read. A bare header is not.
+            self.driver_cache(cache, "92f74448a56b9fe8", [], 5 << 30)
+            self.driver_cache(cache, "92f74448a56b9fe6", [], 32)
+            self.driver_cache(cache, "tuxbox10", [], (1 << 30) - 1)
+            self.assertEqual(launch(), ("tuxbox1", "92f74448a56b9fe8"))
+            self.driver_cache(cache, "tuxbox10", [], 1 << 30)
+            self.assertEqual(launch(), ("tuxbox2", "92f74448a56b9fe8;tuxbox10"))
+            for number in range(2, 11):
+                self.driver_cache(cache, f"tuxbox{number}0", [], 1 << 30 if number < 10 else 64)
+            name, read = launch()
+            self.assertEqual(name, "tuxbox10")
+            self.assertEqual(len(read.split(";")), 10)
+            self.assertNotIn("tuxbox100", read.split(";"))
+            self.assertEqual(launch(__GL_SHADER_DISK_CACHE_APP_NAME="mine"), ("mine", None))
+            self.assertEqual(launch(__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME="theirs"), (None, "theirs"))
 
     def test_a_cache_at_the_index_limit_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

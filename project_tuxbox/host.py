@@ -33,6 +33,11 @@ OFFLINE_EXECUTABLES = ("game_scarlett_master.exe",)
 # enough to stay indexed.
 NVIDIA_CACHE_BYTES = 4 << 30
 
+# A launch starts a new cache file once the current one holds this much, which
+# leaves one launch 3 GiB before the file's 32-bit index is full.
+NVIDIA_CACHE_ROTATE_BYTES = 1 << 30
+NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)0")
+
 
 def requires_offline(executable):
     return executable.name.casefold() in OFFLINE_EXECUTABLES
@@ -322,6 +327,38 @@ def report_unindexed_nvidia_cache(cache, report):
                "while no game is running to let the driver start a new cache.")
 
 
+def rotate_nvidia_shader_cache(env, cache):
+    """Write this launch's pipelines to a file with room left, and read the others.
+
+    The driver's index addresses a cache file with 32-bit offsets, so a file
+    stops taking new pipelines at 4 GiB and every later launch compiles them
+    again. Each launch writes to a numbered file of TuxBox's own, starts the
+    next once that one holds NVIDIA_CACHE_ROTATE_BYTES, and has the driver read
+    every other file. Nothing is moved or deleted. Returns the name written and
+    how many files are only read, or None when the environment names its own.
+    """
+    if env.get("__GL_SHADER_DISK_CACHE_APP_NAME") or env.get("__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"):
+        return None
+    sizes = {}
+    try:
+        for blob in (Path(cache) / "GLCache").glob("*/*/*.bin"):
+            size = blob.stat().st_size
+            if size > NVIDIA_CACHE_HEADER and ";" not in blob.stem:
+                sizes[blob.stem] = max(size, sizes.get(blob.stem, 0))
+    except OSError:
+        return None
+    # The driver appends a 0 to the name it is given.
+    numbers = [int(match[1]) for match in map(NVIDIA_CACHE_FILE.fullmatch, sizes) if match]
+    number = max(numbers, default=1)
+    if sizes.get(f"tuxbox{number}0", 0) >= NVIDIA_CACHE_ROTATE_BYTES:
+        number += 1
+    older = sorted(name for name in sizes if name != f"tuxbox{number}0")
+    env["__GL_SHADER_DISK_CACHE_APP_NAME"] = f"tuxbox{number}"
+    if older:
+        env["__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"] = ";".join(older)
+    return f"tuxbox{number}", len(older)
+
+
 def keep_nvidia_shader_cache(env):
     """Stop NVIDIA's driver deleting an exported cache folder.
 
@@ -372,9 +409,13 @@ def configure_nvidia_shader_cache(env, report=None):
     # The driver's default cap is far smaller than what one Scarlett boot
     # writes, so give this directory room of its own.
     env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+    rotated = rotate_nvidia_shader_cache(env, cache)
     if report:
-        report(f"NVIDIA shader cache: {cache}")
-        report_unindexed_nvidia_cache(cache, report)
+        if rotated:
+            report(f"NVIDIA shader cache: {cache} (writing {rotated[0]}, also reading {rotated[1]} earlier files)")
+        else:
+            report(f"NVIDIA shader cache: {cache}")
+            report_unindexed_nvidia_cache(cache, report)
 
 
 def configure_pipeline_cache(env, prefix):
