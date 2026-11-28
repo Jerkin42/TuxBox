@@ -872,6 +872,101 @@ void raster_heap_stride(ID3D12Device* device) {
     }
 }
 
+// A root-less console compute program reads a structured buffer in the resource
+// heap by thread number and stores the word it found back through a second
+// structured buffer at the same thread index (`shader_fixture.py`). The load is
+// an IDXEN raw access whose record stride the console stores in the descriptor's
+// word 1, which the program carries no way to carry: the provider must retry the
+// translation against a root with the stride table appended and bind that table
+// for the dispatch. A refused pipeline, a skipped dispatch or another stride
+// leaves the output at its decoy.
+void compute_heap_stride(ID3D12Device* device) {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize heap stride root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create heap stride root");
+
+    constexpr UINT records = compute_heap_stride_records, record_bytes = compute_heap_stride_bytes;
+    constexpr UINT words = records * (record_bytes / sizeof(UINT));
+    constexpr UINT64 bytes = UINT64(words) * sizeof(UINT);
+    // Each record starts with a marker and ends with a decoy that must stay.
+    constexpr UINT decoy = 0xD0000000u;
+    std::vector<UINT> input_words(words, decoy);
+    for (UINT i = 0; i < records; ++i) input_words[i * (record_bytes / sizeof(UINT))] = 0x10000000u | (i + 1u);
+    auto input = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(input.Get(), input_words.data(), size_t(bytes));
+    std::vector<UINT> decoy_words(words, decoy);
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(seed.Get(), decoy_words.data(), size_t(bytes));
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> view_heap;
+    check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view_heap)), "create heap stride view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(view_heap.Get(), 9)(view_heap.Get());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer = {0, records, record_bytes, D3D12_BUFFER_SRV_FLAG_NONE};
+    device->CreateShaderResourceView(input.Get(), &srv, {cpu_base + SIZE_T(compute_heap_stride_input_slot) * stride});
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_UNKNOWN;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer = {0, records, record_bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, {cpu_base + SIZE_T(compute_heap_stride_output_slot) * stride});
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {compute_heap_stride_shader, sizeof(compute_heap_stride_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create compute heap stride pipeline");
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto list = direct.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{view_heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    list->SetPipelineState(pipeline.Get());
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    direct.submit();
+    direct.finish("dispatch console heap stride compute");
+
+    D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map heap stride readback");
+    std::vector<UINT> got(words);
+    std::memcpy(got.data(), mapped, size_t(bytes));
+    readback->Unmap(0, &empty);
+    for (UINT i = 0; i < records; ++i) {
+        const UINT base = i * (record_bytes / sizeof(UINT));
+        const UINT expected = 0x10000000u | (i + 1u);
+        if (got[base] == expected
+            && std::all_of(got.begin() + base + 1, got.begin() + base + record_bytes / sizeof(UINT),
+                           [decoy](UINT word) { return word == decoy; })) continue;
+        char message[200];
+        std::snprintf(message, sizeof(message),
+                      "record %u: expected marker %#x, found %#x", i, expected, got[base]);
+        throw std::runtime_error(message);
+    }
+}
+
 // A point-filtered, clamped static sampler at register `slot`, space0.
 D3D12_STATIC_SAMPLER_DESC point_sampler(UINT slot) {
     D3D12_STATIC_SAMPLER_DESC point{};
@@ -3389,6 +3484,7 @@ constexpr Scenario scenarios[] = {
     {L"bindless-table-compute", bindless_table_compute},
     {L"raster-heap-stride", raster_heap_stride},
     {L"large-dispatch", large_dispatch},
+    {L"compute-heap-stride", compute_heap_stride},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -3448,7 +3544,8 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"compute-root-recovery", L"compute-root-srv", L"bindless-compute",
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
                                              L"bindless-table-store", L"bindless-table-compute",
-                                             L"raster-heap-stride", L"large-dispatch"};
+                                             L"raster-heap-stride", L"large-dispatch",
+                                             L"compute-heap-stride"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -3460,8 +3557,8 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its root-aware runtime shader worker.
-        // mixed-lane, raster-heap-stride and large-dispatch also need the live compiler.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
+        // mixed-lane, raster-heap-stride, large-dispatch and compute-heap-stride also need the live compiler.
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcscmp(scenario.name, L"compute-heap-stride") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
             continue;
         const auto name = narrow(scenario.name);
         try {

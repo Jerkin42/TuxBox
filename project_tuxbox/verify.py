@@ -24,7 +24,7 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-compute-root-srv", "lanes-large-dispatch", "lanes-bindless-compute", "lanes-benchmark",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root", "lanes-compute-root-recovery", "lanes-compute-root-srv", "lanes-large-dispatch", "lanes-bindless-compute", "lanes-compute-heap-stride", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
@@ -644,6 +644,72 @@ def lanes_compute_root_srv(host, check, gpu_args, pci, memory_symbols):
                                  root_srv_shader(), slots=3)
 
 
+def lanes_compute_heap_stride(host, check, gpu_args, pci, memory_symbols):
+    """Dispatch the root-less console compute program that reads a structured buffer by thread number.
+
+    The load is an IDXEN raw access whose record stride the console stores in the
+    descriptor's word 1; the program carries no stride. The provider must retry the
+    translation against a root with the heap stride table appended and bind that
+    table, with a paged resource heap. The program carries no embedded root, and
+    no translation against the title's root (which does not carry the table).
+    """
+    from examples.lanes.shader_fixture import heap_stride_compute_shader
+    from .runtime_shaders import shader_session
+    from .shader_prep import SOURCE_CACHE
+
+    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+    key = hashlib.sha256(heap_stride_compute_shader()).hexdigest()
+    messages = []
+
+    def compiled():
+        return {line.removeprefix("Compiled Xbox shader ") for line in messages
+                if line.startswith("Compiled Xbox shader ")}
+
+    def refused():
+        return {match[1] for line in messages if (match := re.match(r"Xbox shader ([0-9a-f]{64}):", line))}
+
+    def forget(keys):
+        # Only this program's entries; a prefix may hold a title cache.
+        for k in keys:
+            for path in [*sources.glob(f"{k}.*"), *sources.parent.glob(f"runtime/*/{k}.*")]:
+                path.unlink()
+
+    def expect_strides(output):
+        if "substituted null compute pipeline" in output:
+            return f"the provider substituted a stand-in pipeline: {messages}"
+        if not compiled():
+            return f"the worker translated nothing: {messages}"
+        if key in compiled() or key in refused():
+            return f"the worker translated a program without its root: {messages}"
+        if "bound paged resource descriptor stride table at compute root slot" not in output:
+            return "the dispatch did not bind the paged stride table"
+        return None
+
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_NULL_PIPELINES",
+             "TUXBOX_DESCRIPTOR_HEAP_LIMIT")
+    saved = {name: host.env.get(name) for name in names}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr",
+                    TUXBOX_NULL_PIPELINES="0", TUXBOX_DESCRIPTOR_HEAP_LIMIT="64")
+    host.env.pop("TUXBOX_SHADER_SESSION", None)
+    try:
+        forget({key})
+        with shader_session(sources.parent, host.env, messages.append):
+            check("lanes-compute-heap-stride", "lanes/lanes.exe",
+                  ["--selftest", "compute-heap-stride", *gpu_args, "--report"],
+                  rf"lanes-selftest PASS pci={pci} scenario=compute-heap-stride passed=1",
+                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                  config="lanes/MicrosoftGame.config", device_factory="xbox",
+                  log_check=expect_strides)
+    finally:
+        forget({key} | compiled() | refused())
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
+
+
 def lanes_reflected_compute_root(host, check, gpu_args, pci, memory_symbols, scenario, program, *, slots,
                                  heap_limit=None):
     """Run a scenario whose program must be translated against a root the provider reflects."""
@@ -1259,6 +1325,8 @@ def verify(host, output, adapter, selected=None, samples=1):
             lanes_compute_root_srv(host, check, gpu_args, pci, memory_symbols)
         if "lanes-large-dispatch" in selected and host.backend == "proton":
             lanes_large_dispatch(host, check, gpu_args, pci, memory_symbols)
+        if "lanes-compute-heap-stride" in selected and host.backend == "proton":
+            lanes_compute_heap_stride(host, check, gpu_args, pci, memory_symbols)
         if "cpu-benchmark" in selected:
             readings = []
             for _ in range(samples):
@@ -1390,6 +1458,7 @@ GATE_LABELS = {
     "lanes-compute-root-recovery": "Partially reflected compute root with an appended descriptor range and paging",
     "lanes-compute-root-srv": "A console compute program under three tables and a root SRV that stores where the title's root declares an SRV",
     "lanes-large-dispatch": "A console compute program dispatched with more than 65,535 groups in a dimension, split with its group IDs intact",
+    "lanes-compute-heap-stride": "A root-less console compute program reads a structured buffer by thread number, through the paged stride table",
     "lanes-bindless-compute-wide": "A direct-indexed compute program's heap UAV through the paged index map",
     "lanes-bindless-compute-constrained": "The same with fewer resident descriptors than the index it uses",
     "lanes-bindless-sampler-wide": "A direct-indexed compute program's literal sampler, added to its paged root",
