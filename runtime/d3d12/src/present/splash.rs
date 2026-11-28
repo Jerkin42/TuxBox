@@ -45,9 +45,6 @@ const STEADY_FRAMES: usize = 4;
 const STEADY_WINDOW: Duration = Duration::from_secs(1);
 /// A title that never presents steadily still reaches the screen.
 const LONGEST: Duration = Duration::from_secs(60);
-/// How long frames wait for the title's thread to take its window's style
-/// back. After that the window is made opaque with the style still on.
-const UNLAYER_WAIT: Duration = Duration::from_secs(5);
 const LARGEST_IMAGE: u32 = 8192;
 /// How often the image is painted again. The title's own thread does not
 /// answer paint requests while the splash is up.
@@ -326,30 +323,6 @@ unsafe fn is_title_window(hwnd: HWND) -> bool {
             && bounds.right - bounds.left >= 320
             && bounds.bottom - bounds.top >= 200
     }
-}
-
-/// Make a window the title created transparent, unless the title layers it
-/// itself. A layered window maps only once it has attributes, so a failure
-/// takes the style back off.
-unsafe fn hide(hwnd: HWND) -> bool {
-    unsafe {
-        let extended = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if WINDOW_EX_STYLE(extended as u32).contains(WS_EX_LAYERED) {
-            return false;
-        }
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, extended | WS_EX_LAYERED.0 as isize);
-        if SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA).is_ok() {
-            return true;
-        }
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, extended);
-        false
-    }
-}
-
-/// Make the title's window opaque again. Wine applies this from any thread
-/// at once; taking the style off waits for the title's thread.
-unsafe fn show(hwnd: HWND) {
-    let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) };
 }
 
 fn run(splash: &Splash, image: &Path) {

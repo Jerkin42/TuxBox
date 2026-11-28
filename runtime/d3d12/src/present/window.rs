@@ -136,12 +136,6 @@ fn fitted_window(
     })
 }
 
-/// The work area of the monitor that shows most of a window.
-pub(super) fn work_area(hwnd: HWND) -> Result<RECT> {
-    // SAFETY: MonitorFromWindow accepts any window handle and has a fallback.
-    Ok(monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })?.rcWork)
-}
-
 /// The window rectangle that fits `width` x `height` into the work area,
 /// with the title window's own frame.
 fn title_bounds(hwnd: HWND, width: u32, height: u32, work: RECT) -> Result<RECT> {
