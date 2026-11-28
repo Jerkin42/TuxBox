@@ -12,11 +12,11 @@
     <title>Overall TuxBox coverage</title>
     <rect x="0" y="0" width="972" height="112" fill="#14141d" stroke="#e2bc8c" />
     <text x="18" y="32" fill="#e2bc8c" font-size="25" text-anchor="start" font-weight="bold">Overall TuxBox coverage</text>
-    <text x="954" y="32" fill="#6fc7d4" font-size="23" text-anchor="end" font-weight="bold">76.2%</text>
+    <text x="954" y="32" fill="#6fc7d4" font-size="23" text-anchor="end" font-weight="bold">76.4%</text>
     <rect x="18" y="45" width="936" height="8" fill="#272733" />
-    <rect x="18" y="45" width="713.6221198156683" height="8" fill="#6fc7d4" />
+    <rect x="18" y="45" width="714.916129032258" height="8" fill="#6fc7d4" />
     <text x="18" y="77" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Library behaviors · 8/9 verified (88.9%)</text>
-    <text x="954" y="77" fill="#d7d7de" font-size="15" text-anchor="end" font-weight="normal">RDNA 2 instructions · 690/1,085 (63.6%)</text>
+    <text x="954" y="77" fill="#d7d7de" font-size="15" text-anchor="end" font-weight="normal">RDNA 2 instructions · 693/1,085 (63.9%)</text>
     <text x="18" y="99" fill="#a0a0b1" font-size="13" text-anchor="start" font-weight="normal">50% required library behaviors, 50% RDNA 2 instructions converted to DXIL.</text>
   </g>
   <g transform="translate(14 184)">
@@ -34,23 +34,23 @@
     <text x="18" y="128" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">All instructions</text>
     <text x="400" y="128" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">converted to DXIL</text>
     <rect x="610" y="118" width="125" height="6" fill="#272733" />
-    <rect x="610" y="118" width="79.49308755760369" height="6" fill="#6fc7d4" />
-    <text x="870" y="128" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">690/1,085</text>
-    <text x="954" y="128" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">63.6%</text>
+    <rect x="610" y="118" width="79.83870967741936" height="6" fill="#6fc7d4" />
+    <text x="870" y="128" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">693/1,085</text>
+    <text x="954" y="128" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">63.9%</text>
     <rect x="18" y="138" width="936" height="1" fill="#272733" />
     <text x="18" y="156" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Used in recorded shaders</text>
     <text x="400" y="156" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">converted to DXIL</text>
     <rect x="610" y="146" width="125" height="6" fill="#272733" />
-    <rect x="610" y="146" width="123.99193548387096" height="6" fill="#6fc7d4" />
-    <text x="870" y="156" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">369/372</text>
-    <text x="954" y="156" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">99.2%</text>
+    <rect x="610" y="146" width="125.0" height="6" fill="#6fc7d4" />
+    <text x="870" y="156" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">372/372</text>
+    <text x="954" y="156" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">100.0%</text>
     <rect x="18" y="166" width="936" height="1" fill="#272733" />
     <text x="18" y="184" fill="#d7d7de" font-size="15" text-anchor="start" font-weight="normal">Used in recorded shaders</text>
     <text x="400" y="184" fill="#d7d7de" font-size="14" text-anchor="start" font-weight="normal">run on AMD and NVIDIA</text>
     <rect x="610" y="174" width="125" height="6" fill="#272733" />
-    <rect x="610" y="174" width="123.99193548387096" height="6" fill="#6fc7d4" />
-    <text x="870" y="184" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">369/372</text>
-    <text x="954" y="184" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">99.2%</text>
+    <rect x="610" y="174" width="125.0" height="6" fill="#6fc7d4" />
+    <text x="870" y="184" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">372/372</text>
+    <text x="954" y="184" fill="#d7d7de" font-size="14" text-anchor="end" font-weight="normal">100.0%</text>
     <text x="18" y="218" fill="#a0a0b1" font-size="13" text-anchor="start" font-weight="normal">Compiled alone through DXC and DXV, or run by a GPU check. Compiling doesn't prove a result matches the console.</text>
   </g>
   <g transform="translate(14 432)">

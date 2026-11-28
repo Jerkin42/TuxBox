@@ -1,7 +1,7 @@
 {
  "scope": "Translated shader requests that hold each instruction, 64-lane and 32-lane translations counted separately. Instruction names only; no shader bytes or translated text",
  "title": "ProjectScarlett 1.0.2.1",
- "translator_tree": "33c51742d3193283e90dc19eae3e44877946aca5",
+ "translator_tree": "5aa6c39a20abfb88be5a1f39da6bbc26bacaea21",
  "translations": 44938,
  "instructions": {
   "buffer_atomic_add": 3396,

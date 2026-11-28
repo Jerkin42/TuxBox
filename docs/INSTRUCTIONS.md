@@ -11,14 +11,14 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 ## Summary
 
 - 1,085 instructions in 1,398 encodings.
-- 372 are used by the recorded shaders; a GPU check runs 369 of those.
+- 372 are used by the recorded shaders; a GPU check runs 372 of those.
 - 210 encodings have no translation, and 186 are unproven: alone they need a bound resource or a stage, and no recorded shader uses them.
 
 | Family | Encodings | Translates | Seen translating | Nothing to emit | Unproven | Not translated | Used | Used without a GPU check |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | [Scalar, two operands (SOP2)](#scalar-two-operands-sop2) | 51 | 51 | 0 | 0 | 0 | 0 | 29 | 0 |
 | [Scalar with a constant (SOPK)](#scalar-with-a-constant-sopk) | 27 | 19 | 0 | 5 | 0 | 3 | 11 | 0 |
-| [Scalar, one operand (SOP1)](#scalar-one-operand-sop1) | 65 | 44 | 0 | 2 | 13 | 6 | 24 | 2 |
+| [Scalar, one operand (SOP1)](#scalar-one-operand-sop1) | 65 | 44 | 0 | 2 | 13 | 6 | 24 | 0 |
 | [Scalar compare (SOPC)](#scalar-compare-sopc) | 18 | 16 | 0 | 0 | 2 | 0 | 12 | 0 |
 | [Program control (SOPP)](#program-control-sopp) | 37 | 11 | 0 | 6 | 1 | 19 | 12 | 0 |
 | [Scalar memory (SMEM)](#scalar-memory-smem) | 20 | 0 | 5 | 5 | 0 | 10 | 9 | 0 |
@@ -28,7 +28,7 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 | [Vector, three operands (VOP3 and VOP3P)](#vector-three-operands-vop3-and-vop3p) | 457 | 421 | 7 | 1 | 1 | 27 | 199 | 0 |
 | [Interpolation (VINTRP)](#interpolation-vintrp) | 3 | 0 | 3 | 0 | 0 | 0 | 3 | 0 |
 | [Group memory (DS)](#group-memory-ds) | 123 | 36 | 0 | 0 | 0 | 87 | 17 | 0 |
-| [Flat, global and scratch memory (FLAT)](#flat-global-and-scratch-memory-flat) | 54 | 0 | 5 | 0 | 0 | 49 | 5 | 1 |
+| [Flat, global and scratch memory (FLAT)](#flat-global-and-scratch-memory-flat) | 54 | 0 | 5 | 0 | 0 | 49 | 5 | 0 |
 | [Untyped buffers (MUBUF)](#untyped-buffers-mubuf) | 75 | 2 | 25 | 0 | 48 | 0 | 25 | 0 |
 | [Typed buffers (MTBUF)](#typed-buffers-mtbuf) | 16 | 0 | 4 | 0 | 12 | 0 | 4 | 0 |
 | [Images (MIMG)](#images-mimg) | 130 | 0 | 21 | 0 | 109 | 0 | 21 | 0 |
@@ -40,9 +40,6 @@ Most used first. Each needs a check before it can be trusted.
 
 | Instruction | Recorded shaders |
 | --- | ---: |
-| `s_swappc_b64` | 679 |
-| `s_setpc_b64` | 12 |
-| `flat_load_ushort` | 4 |
 
 ## Scalar, two operands (SOP2)
 
@@ -165,8 +162,8 @@ Most used first. Each needs a check before it can be trusted.
 | `s_bitset1_b32` | 0x1d | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 1,600 |
 | `s_bitset1_b64` | 0x1e | Unproven: s_bitset1_b64 needs proven ordinary scalar operands (not a wave mask) | — | — |
 | `s_getpc_b64` | 0x1f | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 1,793 |
-| `s_setpc_b64` | 0x20 | Nothing to emit | — | 12 |
-| `s_swappc_b64` | 0x21 | Nothing to emit | — | 679 |
+| `s_setpc_b64` | 0x20 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 12 |
+| `s_swappc_b64` | 0x21 | Nothing to emit | AMD 1002:13c0, NVIDIA 10de:2705 | 679 |
 | `s_rfe_b64` | 0x22 | **No** | — | — |
 | `s_and_saveexec_b64` | 0x24 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 14,772 |
 | `s_or_saveexec_b64` | 0x25 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 916 |
@@ -1232,7 +1229,7 @@ Most used first. Each needs a check before it can be trusted.
 | --- | --- | --- | --- | ---: |
 | `flat_load_ubyte` | 0x8 | **No** | — | — |
 | `flat_load_sbyte` | 0x9 | **No** | — | — |
-| `flat_load_ushort` | 0xa | Yes, in recorded shaders | — | 4 |
+| `flat_load_ushort` | 0xa | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 4 |
 | `flat_load_sshort` | 0xb | **No** | — | — |
 | `flat_load_dword` | 0xc | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 500 |
 | `flat_load_dwordx2` | 0xd | Yes, in recorded shaders | AMD 1002:13c0, NVIDIA 10de:2705 | 537 |
