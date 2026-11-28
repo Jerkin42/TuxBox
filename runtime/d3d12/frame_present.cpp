@@ -59,34 +59,15 @@ DisplayCheck::DisplayCheck(UINT width, UINT height, const wchar_t* window_mode)
                                   nullptr, nullptr, title.hInstance, nullptr);
         if (!window_) throw std::runtime_error("could not create the title window");
         owns_title_ = true;
-        // The provider fits the window as it is created, and keeps it transparent
-        // until its first frame: only the splash shows.
+        // The provider fits the window as it is created and paints the package
+        // image into it until frames come steadily.
         RECT client{};
         POINT origin{};
         measure(client, origin);
-        if (!transparent()) throw std::runtime_error("the title window shows behind the splash" + sizing_);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
-        const auto deadline = GetTickCount64() + 2000;
-        while (!(splash_window_ = FindWindowW(L"TuxBox.Splash", nullptr)) && GetTickCount64() < deadline) {
-            pump();
-            Sleep(10);
-        }
-        if (!splash_window_) throw std::runtime_error("no package splash window" + sizing_);
-        RECT bounds{};
-        MONITORINFO monitor{};
-        monitor.cbSize = sizeof(monitor);
-        GetWindowRect(splash_window_, &bounds);
-        GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor);
-        const auto& area = monitor.rcWork;
-        const auto style = GetWindowLongW(splash_window_, GWL_STYLE), extended = GetWindowLongW(splash_window_, GWL_EXSTYLE);
-        if (bounds.right - bounds.left != splash_width || bounds.bottom - bounds.top != splash_height ||
-            std::abs(bounds.left + bounds.right - area.left - area.right) > 1 ||
-            std::abs(bounds.top + bounds.bottom - area.top - area.bottom) > 1)
-            throw std::runtime_error("the package splash is not the image, centred" + sizing_);
-        if ((style & WS_CAPTION) || !(extended & WS_EX_TOOLWINDOW) || !(extended & WS_EX_NOACTIVATE))
-            throw std::runtime_error("the package splash has a frame, a taskbar entry or takes the focus");
-        if (!splash_shows(4000)) throw std::runtime_error("the package splash did not appear" + describe(sample()));
+        if (!splash_shows(4000)) throw std::runtime_error("the package splash did not appear" + describe(sample()) + sizing_);
+        if (FindWindowW(L"TuxBox.Splash", nullptr)) throw std::runtime_error("the package splash opened a window of its own");
         return;
     }
     UINT client_width = width * 6, client_height = height * 6;
@@ -156,28 +137,25 @@ bool DisplayCheck::shows(COLORREF corner, COLORREF center, ULONGLONG millisecond
     return false;
 }
 
-bool DisplayCheck::transparent() const {
-    BYTE alpha = 255;
-    DWORD flags = 0;
-    return (GetWindowLongW(window_, GWL_EXSTYLE) & WS_EX_LAYERED) &&
-           GetLayeredWindowAttributes(window_, nullptr, &alpha, &flags) && (flags & LWA_ALPHA) && alpha == 0;
-}
-
 bool DisplayCheck::splash_shows(ULONGLONG milliseconds) const {
     const auto deadline = GetTickCount64() + milliseconds;
     do {
         pump();
-        RECT bounds{};
-        if (!IsWindow(splash_window_) || !GetWindowRect(splash_window_, &bounds)) return false;
+        RECT client{};
+        POINT origin{};
+        if (!GetClientRect(window_, &client) || !ClientToScreen(window_, &origin)) return false;
         HDC screen = GetDC(nullptr);
         if (!screen) throw std::runtime_error("could not acquire screen DC");
+        const POINT middle{origin.x + client.right / 2, origin.y + client.bottom / 2};
         bool matched = true;
         for (const auto& at : samples) {
-            // The sample points, moved inside the splash's own rectangle.
-            const LONG x = bounds.left + (bounds.right - bounds.left) * (at.x / 2 + 25) / 100;
-            const LONG y = bounds.top + (bounds.bottom - bounds.top) * (at.y / 2 + 25) / 100;
-            matched &= screen_pixel(screen, splash_window_, {x, y}) == splash_image;
+            // The sample points, moved inside the centred image.
+            const LONG x = middle.x + splash_width * (at.x - 50) / 200;
+            const LONG y = middle.y + splash_height * (at.y - 50) / 200;
+            matched &= screen_pixel(screen, window_, {x, y}) == splash_image;
         }
+        // Outside it the window is black.
+        matched &= screen_pixel(screen, window_, {middle.x - splash_width, middle.y}) == RGB(0, 0, 0);
         ReleaseDC(nullptr, screen);
         if (matched) return true;
         Sleep(16);
@@ -226,11 +204,11 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
     };
     if (splash_ && token == 1) {
         // A lone first frame completes behind the splash, which stays on the screen
-        // while the title's window stays transparent.
+        // in the title's window.
         submit();
         const auto until = GetTickCount64() + 300;
         while (GetTickCount64() < until) {
-            if (!splash_shows(0) || !transparent()) throw std::runtime_error("the first frame ended the package splash");
+            if (!splash_shows(0)) throw std::runtime_error("the first frame ended the package splash");
             Sleep(16);
         }
         return;
@@ -265,15 +243,6 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
         for (size_t i = 0; i < pixels.size(); ++i) matched &= pixels[i] == (i == 4 ? center : corner);
         if (matched) {
             if (splash_) {
-                if (IsWindow(splash_window_)) throw std::runtime_error("the package splash outlived steady frames");
-                // The provider takes the layering off once this thread takes its message.
-                const auto until = GetTickCount64() + 2000;
-                while ((GetWindowLongW(window_, GWL_EXSTYLE) & WS_EX_LAYERED) && GetTickCount64() < until) {
-                    pump();
-                    Sleep(10);
-                }
-                if (GetWindowLongW(window_, GWL_EXSTYLE) & WS_EX_LAYERED)
-                    throw std::runtime_error("the title window kept the splash's layering");
                 // Frames after that still reach the screen.
                 for (int i = 0; i < 10; ++i) {
                     submit();

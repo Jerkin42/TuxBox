@@ -59,7 +59,6 @@ impl Presentation {
         }
 
         let mut session = self.session.lock().map_err(|_| E_FAIL)?;
-        let created = session.is_none();
         let chain = match session.as_mut() {
             Some(chain) => chain,
             // The package splash stays up until the title presents steadily.
@@ -70,12 +69,7 @@ impl Presentation {
             }
             None => session.insert(SwapChain::new(queue, &device, &desc)?),
         };
-        let status = chain.present(queue, source, &desc);
-        if created {
-            // The title's window replaces the splash with its first frame.
-            splash::reveal();
-        }
-        let status = status?;
+        let status = chain.present(queue, source, &desc)?;
         if status == S_OK {
             crate::diagnostics::presented(desc.Width, desc.Height);
         }
