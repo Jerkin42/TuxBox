@@ -1,5 +1,5 @@
 //! Xbox file-to-memory DirectStorage using Windows file handles, RFC 1950
-//! streams and BCPack BC1.
+//! streams and BCPack (BC1, BC3, BC4, BC5, BC7).
 #![allow(non_snake_case)]
 mod abi;
 mod decode;

@@ -1,60 +1,73 @@
 use super::*;
 use crate::encode::{Random, stream};
 
-/// The lane symbols that encode `blocks` with the given references.
-fn symbols(blocks: &[[u8; 8]], references: &[usize]) -> Vec<Vec<u16>> {
-    let mut code = [0u8; 256];
+const WIDTHS: &[u8] = &[8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8];
+
+fn fields(b: &[u8; 8]) -> [u8; 6] {
+    let c0 = u16::from_le_bytes([b[0], b[1]]);
+    let c1 = u16::from_le_bytes([b[2], b[3]]);
+    [
+        (c0 >> 11) as u8,
+        (c0 >> 5 & 63) as u8,
+        (c0 & 31) as u8,
+        (c1 >> 11) as u8,
+        (c1 >> 5 & 63) as u8,
+        (c1 & 31) as u8,
+    ]
+}
+
+fn zigzag(r: i32) -> u16 {
+    if r >= 0 {
+        2 * r as u16
+    } else {
+        (-2 * r - 1) as u16
+    }
+}
+
+/// The residual code nearest zero that takes `from` to `to` modulo `2^bits`.
+fn code(from: u8, to: u8, bits: u8) -> u16 {
+    let size = 1i32 << bits;
+    let mut r = (i32::from(to) - i32::from(from)).rem_euclid(size);
+    if r >= size / 2 {
+        r -= size;
+    }
+    zigzag(r)
+}
+
+/// The lane symbols that encode `blocks` with endpoint references `d` and
+/// index references `x` (each within the chunk, or `d` into the window).
+fn symbols(blocks: &[[u8; 8]], references: &[(usize, usize)]) -> Vec<Vec<u16>> {
+    let mut symbol_of = [0u8; 256];
     for (symbol, codes) in QUADS.iter().enumerate() {
         let key = codes.iter().fold(0usize, |k, &c| k << 2 | usize::from(c));
-        code[key] = symbol as u8;
+        symbol_of[key] = symbol as u8;
     }
-    let fields = |b: &[u8; 8]| {
-        let c0 = u16::from_le_bytes([b[0], b[1]]);
-        let c1 = u16::from_le_bytes([b[2], b[3]]);
-        [
-            (c0 >> 11) as u8,
-            (c0 >> 5 & 63) as u8,
-            (c0 & 31) as u8,
-            (c1 >> 11) as u8,
-            (c1 >> 5 & 63) as u8,
-            (c1 & 31) as u8,
-        ]
-    };
+    let lines = |b: &[u8; 8]| map(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), &CODE_TO_LINE);
     let mut lanes = vec![Vec::new(); 12];
-    for (i, (block, &d)) in blocks.iter().zip(references).enumerate() {
-        let prediction = if d == 0 {
-            [0; 6]
-        } else if d <= i {
-            fields(&blocks[i - d])
-        } else {
-            WINDOW[(i + 256 - d) % 256].unwrap()
+    for (i, (block, &(d, x))) in blocks.iter().zip(references).enumerate() {
+        let prediction = match d {
+            0 => [0; 6],
+            d if d <= i => fields(&blocks[i - d]),
+            d => WINDOW[(i + 256 - d) % 256],
         };
-        lanes[0].push(if d < 128 {
-            2 * d as u16
-        } else {
-            2 * (255 - d as u16) + 1
-        });
-        lanes[1].push(0);
+        let reference = if x == 0 { 0 } else { lines(&blocks[i - x]) };
+        lanes[0].push(code(x as u8, d as u8, 8));
+        lanes[1].push(x as u16);
         for (k, (&f, &p)) in fields(block).iter().zip(&prediction).enumerate() {
-            let size = 1i32 << FIELD_BITS[k];
-            let mut r = (i32::from(f) - i32::from(p)).rem_euclid(size);
-            if r >= size / 2 {
-                r -= size;
-            }
-            lanes[2 + k].push(if r >= 0 {
-                2 * r as u16
-            } else {
-                (-2 * r - 1) as u16
-            });
+            lanes[2 + k].push(code(p, f, FIELD_BITS[k]));
         }
-        let index = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        // Residual positions, then the codebook symbols that carry them.
+        let residual = (0..16).fold(0u32, |w, p| {
+            w | ((lines(block) >> (2 * p)).wrapping_sub(reference >> (2 * p)) & 3) << (2 * p)
+        });
+        let codes = map(residual, &LINE_TO_CODE);
         for (q, (ox, oy)) in [(0, 0), (2, 0), (0, 2), (2, 2)].into_iter().enumerate() {
             let key = [(0, 0), (1, 0), (0, 1), (1, 1)]
                 .iter()
                 .fold(0usize, |k, (dx, dy)| {
-                    k << 2 | (index >> (2 * (4 * (oy + dy) + ox + dx)) & 3) as usize
+                    k << 2 | (codes >> (2 * (4 * (oy + dy) + ox + dx)) & 3) as usize
                 });
-            lanes[8 + q].push(u16::from(code[key]));
+            lanes[8 + q].push(u16::from(symbol_of[key]));
         }
     }
     lanes
@@ -73,40 +86,50 @@ fn the_quadrant_codebook_is_a_bijection() {
 #[test]
 fn random_blocks_round_trip() {
     let mut random = Random(0xbc1);
-    for (count, longest) in [(1usize, 1usize), (64, 150), (700, 150), (3000, 2000)] {
+    for (count, longest, index_references) in [
+        (1usize, 1usize, false),
+        (64, 150, false),
+        (700, 150, true),
+        (3000, 2000, true),
+    ] {
         let blocks: Vec<[u8; 8]> = (0..count).map(|_| random.next().to_le_bytes()).collect();
-        let references: Vec<usize> = (0..count)
-            .map(|i| match random.below(4) {
-                0 => 0,
-                1 => 1 + random.below(i.min(255) as u64 + 1) as usize % 255,
-                // Before the first block: only slots that have a fit.
-                _ => loop {
-                    let d = 1 + random.below(255) as usize;
-                    if d <= i || WINDOW[(i + 256 - d) % 256].is_some() {
-                        break d;
+        let references: Vec<(usize, usize)> = (0..count)
+            .map(|i| {
+                let within = |random: &mut Random| {
+                    if i == 0 {
+                        0
+                    } else {
+                        1 + random.below(i.min(255) as u64) as usize
                     }
-                },
+                };
+                let d = match random.below(3) {
+                    0 => 0,
+                    1 => within(&mut random),
+                    // A block or, before the chunk, a window slot.
+                    _ => 1 + random.below(255) as usize,
+                };
+                let x = if index_references {
+                    within(&mut random)
+                } else {
+                    0
+                };
+                (d, x)
             })
             .collect();
-        let data = stream(
-            &WIDTHS,
-            &symbols(&blocks, &references),
-            longest,
-            &mut random,
-        );
+        let data = stream(WIDTHS, &symbols(&blocks, &references), longest, &mut random);
         let mut out = vec![0u8; count * BLOCK_BYTES];
         let report = decode(&data, &mut out).unwrap();
         assert_eq!(out, blocks.concat());
         let early = references
             .iter()
             .enumerate()
-            .filter(|&(i, &d)| d > i)
+            .filter(|&(i, &(d, _))| d > i)
             .count();
         assert_eq!(
             report,
             Report {
-                window_references: early,
-                unfitted_blocks: 0
+                dictionary_references: early,
+                ..Default::default()
             }
         );
     }
@@ -130,29 +153,15 @@ fn guest_fixture() -> (Vec<u8>, Vec<u8>) {
     .iter()
     .map(|b| b.to_le_bytes())
     .collect();
-    let references = [0, 1, 0, 4];
+    let references = [(0, 0), (1, 0), (0, 0), (4, 0)];
     let mut random = Random(0x6e57);
-    let data = stream(&WIDTHS, &symbols(&blocks, &references), 2, &mut random);
+    let data = stream(WIDTHS, &symbols(&blocks, &references), 2, &mut random);
     (data, blocks.concat())
 }
 
 #[test]
 fn the_guest_fixture_decodes() {
     let (data, blocks) = guest_fixture();
-    if std::env::var_os("PRINT_FIXTURE").is_some() {
-        let hex = |b: &[u8]| {
-            b.iter()
-                .map(|v| format!("0x{v:02x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        println!(
-            "stream {} bytes\n{}\nblocks\n{}",
-            data.len(),
-            hex(&data),
-            hex(&blocks)
-        );
-    }
     assert_eq!(data, GUEST_STREAM);
     let mut out = vec![0u8; blocks.len()];
     decode(&data, &mut out).unwrap();

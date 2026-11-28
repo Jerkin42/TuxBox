@@ -1,17 +1,18 @@
 //! The hardware decode stages of a request, in the documented order: zlib
 //! (RFC 1950), then BCPack. Swizzle is not implemented.
 use std::borrow::Cow;
-use tuxbox_xcrdapi_codec::bc1;
+use tuxbox_xcrdapi_codec::record::{self, Format};
 
 /// `ZlibDecompress`, bit 0 of the request options.
 pub(crate) const ZLIB: u64 = 1;
 /// `BcpackMode`, bits 1-4: the BC format number, 0 for none.
 pub(crate) const BCPACK: u64 = 0xf << 1;
-const BC1: u64 = 1;
 
-/// True when this provider decodes the BCPack mode in `options`.
+/// True when this provider decodes the BCPack mode in `options`: none, BC1,
+/// BC3, BC4, BC5 or BC7. BC2 and BC6H are refused.
 pub(crate) fn supported(options: u64) -> bool {
-    matches!(bcpack_mode(options), 0 | BC1)
+    let mode = bcpack_mode(options);
+    mode == 0 || Format::from_mode(mode).is_some()
 }
 
 fn bcpack_mode(options: u64) -> u64 {
@@ -37,15 +38,13 @@ pub(crate) fn run(
     } else {
         Cow::Borrowed(input)
     };
-    match mode {
-        0 => Ok(packed),
-        BC1 => {
-            let mut blocks = Vec::new();
-            blocks.try_reserve_exact(capacity).map_err(|_| ())?;
-            blocks.resize(capacity, 0);
-            bc1::decode(&packed, &mut blocks).map_err(|_| ())?;
-            Ok(Cow::Owned(blocks))
-        }
-        _ => Err(()),
+    if mode == 0 {
+        return Ok(packed);
     }
+    let format = Format::from_mode(mode).ok_or(())?;
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(capacity).map_err(|_| ())?;
+    blocks.resize(capacity, 0);
+    record::decode(format, &packed, &mut blocks).map_err(|_| ())?;
+    Ok(Cow::Owned(blocks))
 }

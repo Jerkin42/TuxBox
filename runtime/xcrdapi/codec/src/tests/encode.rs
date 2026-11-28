@@ -96,3 +96,28 @@ pub fn stream(widths: &[u8], symbols: &[Vec<u16>], longest: usize, random: &mut 
     }
     queues.stream
 }
+
+/// The residual code nearest zero that takes `from` to `to` modulo `2^bits`.
+pub fn code(from: u8, to: u8, bits: u32) -> u16 {
+    let size = 1i32 << bits;
+    let mut r = (i32::from(to) - i32::from(from)).rem_euclid(size);
+    if r >= size / 2 {
+        r -= size;
+    }
+    if r >= 0 {
+        2 * r as u16
+    } else {
+        (-2 * r - 1) as u16
+    }
+}
+
+/// Random endpoint and index references for block `i`: zero, a block of the
+/// chunk, or a dictionary entry.
+pub fn references(i: usize, random: &mut Random) -> (usize, usize) {
+    let mut one = || match random.below(3) {
+        0 => 0,
+        1 if i > 0 => 1 + random.below(i.min(255) as u64) as usize,
+        _ => 1 + random.below(255) as usize,
+    };
+    (one(), one())
+}
