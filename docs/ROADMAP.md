@@ -2,7 +2,7 @@
 
 This is the plan for two pieces of work: making the shader translator complete and fast, and auditing the whole project part by part. Each task below has an ID. To take one, open an issue named after it (for example "T2: GPU checks for float instructions") so effort isn't doubled. [Where to improve](FOCUS.md) lists other open areas, and [CONTRIBUTING](../CONTRIBUTING.md) has the rules every change follows.
 
-Figures are from `main` on 27 November 2026 and one title's recorded shaders (ProjectScarlett 1.0.2.1), unless noted.
+Figures are from `main` on 28 November 2026 and one title's recorded shaders (ProjectScarlett 1.0.2.1), unless noted.
 
 ## The goal
 
@@ -19,8 +19,8 @@ HLSL is how we get there today. It stays for as long as it is the best route, an
 
 | Measure | Today |
 | --- | --- |
-| Recorded shaders that translate, 64-lane hosts | 38,724 of 42,859 |
-| Recorded compute shaders that translate, 32-lane hosts | 6,075 of 7,683 |
+| Recorded shaders that translate, 64-lane hosts | 38,781 of 42,859 |
+| Recorded compute shaders that translate, 32-lane hosts | 6,157 of 7,683 |
 | Instructions the decoder names | 1,085, in 1,398 encodings ([inventory](INSTRUCTIONS.md)) |
 | Instructions the recorded shaders use | 372 |
 | Of those, run by a GPU check | 369 |
@@ -29,7 +29,7 @@ HLSL is how we get there today. It stays for as long as it is the best route, an
 | Share of translate-and-compile time spent in DXC | nearly all; the translator itself averages about 30 ms a shader |
 | Translated HLSL | median 97 KB; one shader in a hundred is over 1.8 MB |
 
-Three things follow. Most instructions real shaders use have no test that runs them on a GPU. No real shader's output is checked at all. And the time goes to compiling very large generated HLSL, so the route and the size of what we generate matter more than the translator's own speed.
+Three things follow. Nearly every instruction real shaders use is now run on both vendors' cards, but only in synthetic programs. No real shader's output is checked at all. And the time goes to compiling very large generated HLSL, so the route and the size of what we generate matter more than the translator's own speed.
 
 ## Part 1: shader translation
 
@@ -42,8 +42,8 @@ Nothing later is safe without this.
 | ID | Task | Done when |
 | --- | --- | --- |
 | T1 | **Done: [INSTRUCTIONS.md](INSTRUCTIONS.md).** Instruction inventory. Generate a table of every RDNA 2 instruction from AMD's published instruction set reference: decoded, translated, run by a GPU check, used by recorded shaders. Generate it from code and check it in CI, as `RESULTS.md` is generated from evidence | The table is in `docs/`, and CI fails when it is stale |
-| T2 | **GPU checks for used instructions.** Add the 3 used instructions that still have no check, [most used first](INSTRUCTIONS.md#used-without-a-gpu-check). The assembled checks (`tools/check_basic_alu_gpu.py` and its siblings) take one line and a reference model per instruction. Start with `v_mul_legacy_f32`, `v_fmac_f32`, `v_rsq_f32`, `v_cos_f32`, `v_sin_f32`, `v_fract_f32`, the `v_cvt_f32_ubyte` family and the float `v_cmpx` family | Every instruction recorded shaders use is run on AMD and NVIDIA |
-| T3 | **Operand forms and lane states.** A check that holds an instruction doesn't cover every form. For each family, cover literal and register operands, SDWA and DPP modifiers, and lanes outside EXEC | The inventory shows forms, not only names |
+| T2 | **Nearly done: 369 of 372.** GPU checks for used instructions. Three [remain](INSTRUCTIONS.md#used-without-a-gpu-check): `s_swappc_b64`, `s_setpc_b64` and `flat_load_ushort`. They are calls, jumps and loads from a program's own code, so each needs a program built around it rather than one line in `tools/check_basic_alu_gpu.py` | Every instruction recorded shaders use is run on AMD and NVIDIA |
+| T3 | **In progress.** Operand forms and lane states. A check that holds an instruction doesn't cover every form. Every modifier and memory field (VOP3, VOP3P, SDWA, DPP16, DPP8, buffer, typed buffer, image, LDS, flat and scalar loads) has been flipped one at a time to see whether the translation reads it. A field it can't honour now refuses instead of being ignored. Every field recorded shaders set is honoured, and `v_fma_mix` clamp, fused rounding and inline half constants were fixed. Left: GPU checks for each form, and showing forms in the inventory | The inventory shows forms, not only names |
 | T4 | **Run real shaders.** Execute recorded compute shaders with generated inputs and bound resources, and compare outputs: before and after a change, and between an AMD and an NVIDIA card. Add it to the harness as a stage. Graphics stages follow | A change that alters a real shader's results fails the harness |
 | T5 | **A console reference.** Where an RDNA 2 desktop card is available, run the same instructions natively through its Vulkan driver and compare. It is the closest thing to the console we can measure | One documented, repeatable comparison |
 
@@ -53,7 +53,7 @@ Nothing later is safe without this.
 | --- | --- | --- |
 | T6 | **Rank refusals by what a game loses.** Join the harness's refusal list with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail). Recorded requests overstate some refusals, such as `mesh root signature missing` (1,567), which a live launch may never hit | A ranked list in `docs/SHADERS.md`, regenerated by one command |
 | T7 | **Bindings.** The largest refusal groups are about resources, not instructions: stores and atomics to a table the root signature doesn't describe as writable (about 1,660), sampler descriptors (about 460), and tables the root doesn't describe (about 500) | Each group has a cause, and a fix or a stated reason it can't be fixed |
-| T8 | **One lane model for every host.** 53 compute shaders translate for 64-lane hosts and not for 32-lane ones, and wave operations in divergent control flow still refuse on both. Several mechanisms now overlap: guards, votes, ballots, lockstep, two lanes per thread, half waves. Describe one model they all fit, then fold them into it | The model is written down; no recorded shader translates on only one width |
+| T8 | **One lane model for every host.** 53 compute shaders translate for 64-lane hosts and not for 32-lane ones, and wave operations in divergent control flow still refuse on both. Several mechanisms now overlap: guards, votes, ballots, lockstep, two lanes per thread, half waves. Describe one model they all fit, then fold them into it. The rule they share: a scalar value and every branch are the whole wave's, while each lane holds its own bit of a mask. Branches on EXEC and VCC now follow it wherever the ballots apply. Branches on SCC from a mask operation are still each lane's | The model is written down; no recorded shader translates on only one width |
 | T9 | **Unused instructions.** Work through the inventory's untranslated rows: translate with a GPU check, or record why a title can't emit it | No row is blank |
 | T10 | **Other titles.** The figures above are one title. Record requests from a second and run the harness on them | A second request set gives a report |
 
