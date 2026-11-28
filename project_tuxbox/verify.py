@@ -955,7 +955,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                   providers={"xapu/xapu.dll": ("XApuConnect", "XApuEnqueueCommand", "XApuDequeueResult")})
         if "xcrdapi" in selected:
             check("xcrdapi", "xcrdapi/xcrdapi-read.exe", [],
-                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=1 autosubmit=64 PASS",
+                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=1 bc1=4 autosubmit=64 PASS",
                   providers={"xcrdapi/xcrdapi.dll": ("DStorageGetFactory",)})
         if "xmem" in selected:
             check("xmem-heaps", "xmem-smoke/xmem-smoke.exe", ["--heaps", "--report"],

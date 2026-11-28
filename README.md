@@ -70,4 +70,4 @@ Every change must pass the checks relevant to it, on a real GPU where it affects
 
 ## `06 / license`
 
-Copyright © 2026 TuxBox contributors. TuxBox is licensed under the [Apache License 2.0](LICENSE). Third-party materials retain their own terms. [Third-party notices](docs/REFERENCES.md#shader-compiler-attribution)
+Copyright © 2026 TuxBox contributors. TuxBox is licensed under the [Apache License 2.0](LICENSE). Third-party materials retain their own terms. [Third-party notices](docs/REFERENCES.md#shader-compiler-attribution) · BCPack decoding is based on [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) by Ahmet Dedeler and Microsoft's [silicon-rans](https://github.com/microsoft/silicon-rans). [Storage codec notices](docs/REFERENCES.md#storage-codec-attribution)

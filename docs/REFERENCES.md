@@ -36,6 +36,14 @@ TuxBox reads DXBC signatures, pipeline validation data, and root signatures from
 
 TuxBox independently emits HLSL for supported pixel and compute shaders, including exports, fragment discards, buffer initializers and selected game shader programs. The default compiler also includes the TomBox-derived HLSL emitter and its resource-binding code, which Frosty still needs for most shaders. Building the compiler with `--no-default-features` omits that implementation. ScarlettX is a research reference. [Shader coverage and build commands](SHADERS.md#independent-translation) · [Compiler notice](../tools/shader-compiler/NOTICE) · [Apache license](licenses/tombox/Apache-2.0.txt)
 
+## Storage codec attribution
+
+`runtime/xcrdapi/codec` decodes the console's BCPack texture streams for DirectStorage requests.
+
+- **The rANS lane decoder** follows Microsoft's MIT-licensed reference Verilog `mdu_minirans.v` at [2f6827d](https://github.com/microsoft/silicon-rans/tree/2f6827d8a4e6a78029c372f20d8b61f7cd408fc5). Its probability models are that file's `freq_table`, generated into `src/models.rs` by `gen_models.py`. [Microsoft licence](licenses/silicon-rans/MIT.txt)
+- **The multi-lane feeder, the lockstep output and the BC1 block rebuild** are ported from [bcpack-rs by Ahmet Dedeler](https://github.com/Ahmet-Dedeler/bcpack-rs/tree/5bf5cc56ed56f1ababf1f9592300bd182ff90bd8) at 5bf5cc5 (`src/rans.rs`, `src/bc1.rs` and `docs/BCPACK_SPEC.md`), used under its Apache-2.0 option. The ported files keep its header.
+- **The BC1 window and quadrant codebook** in `src/bc1_tables.rs` are the values of bcpack-rs's `data/bc1_window.json` and `data/bc1_quad_table.json` at the same revision. bcpack-rs fitted them on retail texture data, so they are close to the hardware's constants but not proven equal to them.
+
 ## Source attribution for runtime patches
 
 The graphics patches in `tools/reference/tombox-*.patch` target the `d3d12_xs` and `tuxbox-xshader` crates in brcly’s fork of drycheetah84/TomBox. Credit for the underlying runtime and translator belongs to the TomBox contributors. Both crate manifests declare `MIT OR Apache-2.0`. Source from those crates appearing in the patches is distributed here under the Apache License, Version 2.0. The unified diffs identify the changes made for TuxBox. [Original TomBox project](https://github.com/drycheetah84/TomBox) · [Fork history](https://github.com/brcly/TomBox/commits/ca6cf6a6b44e36d3ca4420db55a660a7bc6d6d5a/) · [D3D12 manifest](https://github.com/brcly/TomBox/blob/ca6cf6a6b44e36d3ca4420db55a660a7bc6d6d5a/crates/compat/d3d12_xs/Cargo.toml) · [Shader translator manifest](https://github.com/brcly/TomBox/blob/ca6cf6a6b44e36d3ca4420db55a660a7bc6d6d5a/crates/tuxbox-xshader/Cargo.toml) · [Applicable Apache license text](licenses/tombox/Apache-2.0.txt)

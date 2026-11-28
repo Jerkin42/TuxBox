@@ -29,7 +29,7 @@
 /// Widest symbol the decoder produces.
 pub const MAX_SYMBOL_BITS: u8 = 9;
 const SEGMENTS: usize = MAX_SYMBOL_BITS as usize + 1;
-const LOWER: u32 = 1 << 24;
+pub(crate) const LOWER: u32 = 1 << 24;
 const TOTAL: u32 = 1 << 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,10 @@ pub enum Error {
     Stalled,
     /// A low state word of 0, which no encoder produces.
     BadState,
+    /// A lane finished in a state other than 2^24, 2^16 or 2^8.
+    EndState,
+    /// Bytes other than zero padding follow the last byte the lanes read.
+    TrailingData,
 }
 
 /// One probability model for an alphabet of `bits` bits.
@@ -106,12 +110,23 @@ impl Model {
 
     /// Symbol whose slot holds the low state word `slot`, decoding at most
     /// `bits` bits.
-    fn symbol(&self, slot: u32, bits: u8) -> u16 {
+    pub(crate) fn symbol(&self, slot: u32, bits: u8) -> u16 {
         let mut s = usize::from(bits);
         while s > 0 && slot < self.base[s] {
             s -= 1;
         }
         (segment_start(s) + (slot - self.base[s]) / self.freq[s]) as u16
+    }
+}
+
+impl Model {
+    /// The state after decoding `symbol` from `state`, as the hardware
+    /// computes it (modulo 2^32).
+    pub(crate) fn advance(&self, state: u32, symbol: u16) -> u32 {
+        let (start, freq) = self.interval(symbol).unwrap_or((0, 0));
+        freq.wrapping_mul(state >> 16)
+            .wrapping_add(state & (TOTAL - 1))
+            .wrapping_sub(start)
     }
 }
 
@@ -142,7 +157,7 @@ impl Models {
         self.by_width[bits][usize::from(index & 15)] = Some(model);
     }
 
-    fn get(&self, bits: u8, index: u8) -> Option<&Model> {
+    pub(crate) fn get(&self, bits: u8, index: u8) -> Option<&Model> {
         self.by_width
             .get(usize::from(bits))?
             .get(usize::from(index))?
