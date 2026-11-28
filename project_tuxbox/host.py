@@ -16,6 +16,7 @@ from .mangohud import performance_capture
 from .pipeline_profile import pipeline_capture
 from .runtime_shaders import runtime_shader_compiler
 from .shader_prep import SOURCE_CACHE
+from .vkd3d_cache import merge_pipeline_cache
 
 
 # The Proton distribution used when none is selected. Its dxil-spirv converts
@@ -565,6 +566,7 @@ class Host:
         try:
             if self.backend in ("proton", "wine"):
                 configure_nvidia_shader_cache(env, log.status)
+                merge_pipeline_cache(env, executable, log.status)
             if "-nullrhi" not in (arg.lower() for arg in arguments):
                 configure_console_cbv(self.backend, env, executable, log.status)
             capture = performance_capture(self.backend, env, executable, log) if mangohud else nullcontext()
