@@ -102,7 +102,8 @@ class ProgressMapTests(unittest.TestCase):
             graphic = render_map(root)
             # s_add_u32 compiled alone; v_add_f32 and v_sub_f32 ran in a GPU check.
             self.assertIn(">3/1,085<", graphic)
-            self.assertIn("Used by Example 1.0", graphic)
+            self.assertIn("Used in recorded shaders", graphic)
+            self.assertNotIn("Example 1.0", graphic)
             # Of the four used, three are converted, and one ran on both vendors.
             self.assertIn(">3/4<", graphic)
             self.assertIn(">1/4<", graphic)
@@ -174,39 +175,14 @@ class ProgressMapTests(unittest.TestCase):
             self.assertIn("RDNA 2 instructions · Unmeasured", render_map(root))
             self.assertNotIn(">25.1%<", render_map(root))
 
-    def test_frosty_milestones_use_matching_retail_profile_and_tuxbox_run(self):
+    def test_the_map_names_no_game(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "matrix-awakens-launch.json").write_text(json.dumps({
-                "sha256": "game", "progress_receipt": "latest.json"}))
-            receipt = {
-                "title_sha256": "game",
-                "settings": {"graphics_profile": "packaged", "loose_graphics_overrides_in_package": 0,
-                             "ray_tracing": 1, "lumen_hardware_ray_tracing": 1},
-                "runs": {"tuxbox": {"log_sha256": "tuxbox", "verified_milestones": ["load_world", "submit_frame"]},
-                         "control": {"log_sha256": "other", "verified_milestones": ["use_menu", "play_chase"]}},
-                "failure": {"global_shader": 219, "entry": "ExampleCS"},
-            }
-            file = root / "latest.json"
-            file.write_text(json.dumps(receipt))
-            svg = ET.fromstring(render_map(root))
-            labels = [node.text for node in svg.findall(".//{*}text")]
-            self.assertIn("Frosty retail test", labels)
-            self.assertNotIn("25%", labels)
-            self.assertIn("Packaged settings · World loaded · Frame submitted", labels)
-            self.assertNotIn("Menu used", render_map(root))
-            self.assertIn("Blocked at global shader 219 · ExampleCS", labels)
-            for field, value in [("graphics_profile", "reduced"), ("loose_graphics_overrides_in_package", 1),
-                                 ("ray_tracing", 0), ("lumen_hardware_ray_tracing", 0)]:
-                with self.subTest(field=field):
-                    file.write_text(json.dumps(dict(receipt, settings=dict(receipt["settings"], **{field: value}))))
-                    graphic = render_map(root)
-                    self.assertIn("No matching retail run", graphic)
-                    self.assertNotIn("World loaded", graphic)
-                    self.assertNotIn("ExampleCS", graphic)
-            file.write_text(json.dumps(dict(receipt, title_sha256="other")))
-            self.assertIn("No matching retail run", render_map(root))
-            receipt["runs"]["tuxbox"]["verified_milestones"].append("unknown")
-            file.write_text(json.dumps(receipt))
-            with self.assertRaisesRegex(ValueError, "Unknown Frosty milestone"):
-                render_map(root)
+            self.write_library_audit(root)
+            self.write_instruction_evidence(root)
+            (root / "matrix-awakens-launch.json").write_text(json.dumps({"sha256": "game", "progress_receipt": "latest.json"}))
+            (root / "latest.json").write_text(json.dumps({"title_sha256": "game", "runs": {"tuxbox": {
+                "log_sha256": "tuxbox", "verified_milestones": ["load_world"]}}}))
+            graphic = render_map(root)
+            for name in ("Frosty", "Example 1.0", "retail", "Decoded frames reached the game."):
+                self.assertNotIn(name, graphic)

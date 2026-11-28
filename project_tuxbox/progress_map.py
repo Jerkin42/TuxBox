@@ -53,20 +53,6 @@ def window(group, width, height, path, *, focused=False):
 
 
 # Labels for observations in a packaged-settings retail run.
-FROSTY_GATES = {
-    "load_world": "World loaded",
-    "submit_frame": "Frame submitted",
-    "use_menu": "Menu used",
-    "load_wake_up_room": "Wake Up room loaded",
-    "load_chase_intro": "Chase intro loaded",
-    "play_chase": "Chase played",
-    "explore_city": "City explored",
-    "verify_visuals": "Visuals verified",
-    "verify_audio": "Audio verified",
-    "verify_frame_pacing": "Frame pacing verified",
-}
-
-
 def draw_overall(svg, y, paths, instructions):
     verified = sum(row["status"] == "verified" for row in paths)
     library_share = verified / len(paths) if paths else None
@@ -87,52 +73,7 @@ def draw_overall(svg, y, paths, instructions):
                          if instruction_share is not None else "Unmeasured")
     text(group, 18, 77, f"Library behaviors · {library_label}", 15)
     text(group, INNER-18, 77, f"RDNA 2 instructions · {instruction_label}", 15, anchor="end")
-    text(group, 18, 99, "50% required Frosty library behaviors, 50% RDNA 2 instructions converted to DXIL.", 13, MUTED)
-    return y+height+GAP
-
-
-def draw_frosty_target(svg, y, evidence):
-    title = read_json(evidence / "matrix-awakens-launch.json")
-    if not title:
-        return y
-    receipt = read_json(evidence / title["progress_receipt"]) if title.get("progress_receipt") else {}
-    settings = receipt.get("settings", {})
-    run = receipt.get("runs", {}).get("tuxbox", {})
-    measured = bool(title.get("sha256") and title["sha256"] == receipt.get("title_sha256")
-                    and run.get("log_sha256") and "verified_milestones" in run
-                    and settings.get("graphics_profile") == "packaged"
-                    and settings.get("loose_graphics_overrides_in_package") == 0
-                    and settings.get("ray_tracing") == settings.get("lumen_hardware_ray_tracing") == 1)
-    verified = set(run["verified_milestones"]) if measured else set()
-    unknown = verified.difference(FROSTY_GATES)
-    if unknown:
-        raise ValueError(f"Unknown Frosty milestone(s): {sorted(unknown)}")
-    failure = receipt.get("failure", {}) if measured else {}
-    shader = failure.get("global_shader")
-    blocker = f"Blocked at global shader {shader} · {failure['entry']}" if shader is not None else ""
-    labels = [label for key, label in FROSTY_GATES.items() if key in verified]
-    # Five or more observations wrap to a second line within the SVG.
-    lines = [" · ".join(labels[pos:pos+4]) for pos in range(0, len(labels), 4)]
-    if not lines:
-        lines = ["No verified gameplay observations" if measured else "No matching retail run"]
-    reduced = read_json(evidence / "matrix-awakens/wake-up-xg.json")
-    executable = reduced.get("providers", {}).get("Frosty-XSX-Shipping.exe", {})
-    reduced_settings = reduced.get("profile_cvars", {})
-    reached_wake_up = (bool(title.get("sha256")) and executable.get("sha256") == title["sha256"]
-                       and reduced.get("fixed_log_sha256") and reduced_settings.get("r.RayTracing") == "0"
-                       and reduced_settings.get("r.Lumen.DiffuseIndirect.Allow") == "0"
-                       and reduced_settings.get("r.Lumen.Reflections.Allow") == "0"
-                       and any(event.get("event") == "Construct bullet time" for event in reduced.get("events", [])))
-    height = 65 + 22*len(lines) + (30 if blocker else 0) + (30 if reached_wake_up else 0)
-    group = section(svg, PAD, y, "Frosty retail test")
-    rect(group, 0, 0, INNER, height, PANEL, stroke=LINE)
-    text(group, 18, 32, "Frosty retail test", 23, AMBER, bold=True)
-    for index, line in enumerate(lines):
-        text(group, 18, 61+22*index, ("Packaged settings · " if index == 0 else "") + line, 15)
-    if blocker:
-        text(group, 18, 91+22*(len(lines)-1), blocker, 15, AMBER)
-    if reached_wake_up:
-        text(group, 18, height-13, "Reduced settings · Wake Up reached the bullet-time scene", 15, GREEN)
+    text(group, 18, 99, "50% required library behaviors, 50% RDNA 2 instructions converted to DXIL.", 13, MUTED)
     return y+height+GAP
 
 
@@ -195,7 +136,7 @@ def draw_libraries(svg, y, rows):
     for index, row in enumerate(rows):
         top = 149 + 29*index
         cell = element(group, "g")
-        element(cell, "title").text = f"{', '.join(row['libraries'])} · {row['scope']}"
+        element(cell, "title").text = ", ".join(row["libraries"])
         rect(cell, 18, top-19, INNER-36, 1, LINE)
         text(cell, 18, top, row["name"], 15)
         text(cell, 420, top, row["provider"], 14)
@@ -432,7 +373,7 @@ def instruction_coverage(evidence):
     used = {name for name, count in use.get("instructions", {}).items() if count and name in names}
     return {"total": len(names), "covered": len(covered), "share": len(covered) / len(names),
             "compiled": len(compiled), "used": len(used), "used_covered": len(used & covered),
-            "used_on_both": len(used & on_both), "title": use.get("title")}
+            "used_on_both": len(used & on_both)}
 
 
 def draw_instructions(svg, y, coverage):
@@ -440,9 +381,8 @@ def draw_instructions(svg, y, coverage):
         return y
     rows = [("All instructions", coverage["covered"], coverage["total"], "converted to DXIL")]
     if coverage["used"]:
-        title = coverage["title"] or "recorded shaders"
-        rows += [(f"Used by {title}", coverage["used_covered"], coverage["used"], "converted to DXIL"),
-                 (f"Used by {title}", coverage["used_on_both"], coverage["used"], "run on AMD and NVIDIA")]
+        rows += [("Used in recorded shaders", coverage["used_covered"], coverage["used"], "converted to DXIL"),
+                 ("Used in recorded shaders", coverage["used_on_both"], coverage["used"], "run on AMD and NVIDIA")]
     height = 152 + 28*len(rows)
     group = section(svg, PAD, y, "RDNA 2 instructions")
     window(group, INNER, height, "~/docs/INSTRUCTIONS.md")
@@ -480,9 +420,8 @@ def render_map(evidence):
                              "aria-labelledby": "map-title map-description"})
     element(svg, "title", id="map-title").text = "TuxBox runtime compatibility"
     element(svg, "desc", id="map-description").text = (
-        "Overall coverage gives equal weight to verified Frosty library behaviors and RDNA 2 instructions "
-        "converted to HLSL that compiles to DXIL. "
-        "Gameplay results identify the graphics settings used.")
+        "Overall coverage gives equal weight to verified library behaviors and RDNA 2 instructions "
+        "converted to HLSL that compiles to DXIL.")
     bg = rect(svg, 0, 0, WIDTH, 1, BG)
     rect(svg, 0, 0, WIDTH, 48, BAR)
     rect(svg, 0, 47, WIDTH, 1, LINE)
@@ -496,7 +435,6 @@ def render_map(evidence):
     y = draw_overall(svg, 48+GAP, paths, instructions)
     y = draw_instructions(svg, y, instructions)
     y = draw_libraries(svg, y, paths)
-    y = draw_frosty_target(svg, y, evidence)
     height = draw_verification(svg, y, evidence) + 6
     bg.set("height", str(height))
     svg.set("viewBox", f"0 0 {WIDTH} {height}")
