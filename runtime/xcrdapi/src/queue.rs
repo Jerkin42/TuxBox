@@ -1,4 +1,5 @@
 use super::*;
+use crate::{decode, diag};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
@@ -54,10 +55,15 @@ struct Read {
     dest: usize,
     capacity: usize,
     size: usize,
+    /// Bytes between the zlib and BCPack stages.
+    intermediate: usize,
     options: u64,
     tag: u64,
     cancelled: bool,
 }
+
+/// Options that need the source staged and decoded before it is written.
+const DECODED: u64 = decode::ZLIB | decode::BCPACK;
 
 // Borrowed process buffer addresses are valid until queue completion by the
 // DirectStorage contract. The file is retained independently of its COM object.
@@ -67,7 +73,9 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
     // Bit 21: the destination is an array of 64 KiB physical page tokens,
     // written linearly from `page_offset` into the first page.
     const TO_PAGES: u64 = 1 << 21;
-    if req.options & !(FROM_MEMORY | TO_PAGES | 1) != 0 {
+    if req.options & !(FROM_MEMORY | TO_PAGES | decode::ZLIB | decode::BCPACK) != 0
+        || !decode::supported(req.options)
+    {
         return Err(E_NOTIMPL);
     }
     // Snapshot the page array now: the title may reuse it after enqueueing.
@@ -88,7 +96,8 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
         || req.source.is_null()
         || req.size == 0
         || req.destination_size == 0
-        || (req.options & 1 == 0 && req.size > req.destination_size)
+        || (req.options & DECODED == 0 && req.size > req.destination_size)
+        || (req.options & decode::ZLIB != 0 && req.options & decode::BCPACK != 0 && req.intermediate_size == 0)
     {
         return Err(E_INVALIDARG);
     }
@@ -107,6 +116,7 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
         dest: req.destination as usize,
         capacity: req.destination_size as usize,
         size: req.size as usize,
+        intermediate: req.intermediate_size as usize,
         options: req.options,
         tag: req.tag,
         cancelled: false,
@@ -139,7 +149,7 @@ impl Read {
         }
         // The title's staging size bounds one compressed read. Keep the limit,
         // but decode into a per-request buffer so reads can run in parallel.
-        if self.options & 1 != 0
+        if self.options & DECODED != 0
             && matches!(self.source, Source::File(..))
             && let Some((limit, _)) = lock(&STAGING).as_ref()
             && self.size > *limit
@@ -149,7 +159,7 @@ impl Read {
         let mut local = Vec::new();
         let compressed = &mut local;
         let mut plain = Vec::new();
-        let target = if self.options & 1 != 0 {
+        let target = if self.options & DECODED != 0 {
             compressed
                 .try_reserve_exact(self.size)
                 .map_err(|_| E_OUTOFMEMORY)?;
@@ -198,7 +208,7 @@ impl Read {
             }
             Source::Memory(p) => unsafe { core::ptr::copy(*p as *const u8, target, self.size) },
         }
-        if self.options & 1 != 0 {
+        if self.options & DECODED != 0 {
             // ReadFile or the copy above initialized every reported input byte.
             unsafe { compressed.set_len(self.size) };
             {
@@ -206,8 +216,7 @@ impl Read {
                 stats.pending_decodes += 1;
                 stats.total_decodes = stats.total_decodes.saturating_add(1);
             }
-            let output =
-                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, self.capacity);
+            let output = decode::run(compressed, self.options, self.capacity, self.intermediate);
             {
                 let mut stats = storage_stats();
                 stats.pending_decodes -= 1;
@@ -344,6 +353,9 @@ fn execute_reads(shared: &Shared, batch: &[Entry]) -> Vec<Result<(), HRESULT>> {
 
 fn finish(shared: &Shared, entry: &Entry, result: Result<(), HRESULT>, last_error: &mut HRESULT) {
     if let Err(hr) = result {
+        if let Entry::Read(read) = entry {
+            diag::failed(read.options);
+        }
         if last_error.is_ok() {
             *last_error = hr;
         }
@@ -472,6 +484,7 @@ impl Queue {
         }
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
+            diag::flush();
         }
     }
 }
@@ -485,10 +498,12 @@ impl Drop for Queue {
 
 impl IQueue_Impl for Queue_Impl {
     unsafe fn EnqueueRequest(&self, req: *const Request) {
-        self.enqueue(
-            unsafe { capture(self.source_type, req) }
-                .map_or_else(|e| Entry::Invalid(e, 0), Entry::Read),
-        );
+        let captured = unsafe { capture(self.source_type, req) };
+        if let Some(r) = unsafe { req.as_ref() } {
+            let refused = captured.as_ref().err().copied();
+            diag::request(r.options, r.size, r.destination_size, r.intermediate_size, refused);
+        }
+        self.enqueue(captured.map_or_else(|e| Entry::Invalid(e, 0), Entry::Read));
     }
     unsafe fn EnqueueStatus(&self, array: *mut c_void, index: u32) {
         let entry = unsafe { IUnknown::from_raw_borrowed(&array) }
@@ -609,7 +624,7 @@ impl IQueue2_Impl for Queue_Impl {
 }
 
 
-fn debug(text: &str) {
+pub(crate) fn debug(text: &str) {
     let line = std::ffi::CString::new(format!("{text}\n")).unwrap_or_default();
     unsafe { windows::Win32::System::Diagnostics::Debug::OutputDebugStringA(windows::core::PCSTR(line.as_ptr().cast())) };
 }
